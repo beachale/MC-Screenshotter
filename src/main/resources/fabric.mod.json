@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "panshot",
+  "version": "${version}",
+  "name": "PanShot",
+  "description": "Detaches the render camera from the player and teleports it independently.",
+  "authors": [
+    "panshot"
+  ],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.panshot.spectatorcam.SpectatorCamClient"
+    ]
+  },
+  "mixins": [
+    "panshot.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.15.11",
+    "fabric": "*",
+    "minecraft": "~1.21",
+    "java": ">=21"
+  }
+}

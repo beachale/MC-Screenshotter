@@ -1,0 +1,806 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PanShot Panorama Viewer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --panel-bg: rgba(18, 20, 28, 0.78);
+      --panel-border: rgba(255, 255, 255, 0.18);
+      --text: #f4f7ff;
+      --muted: #b1bdd4;
+      --accent: #55b7ff;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #0b0e16;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      color: var(--text);
+    }
+    #viewerStack {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+    }
+    .viewerLayer {
+      position: absolute;
+      inset: 0;
+    }
+    .viewerLayer canvas {
+      image-rendering: pixelated;
+    }
+    #liveStack {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+    }
+    #liveViewerA {
+      z-index: 2;
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #liveViewerB {
+      z-index: 1;
+      opacity: 0;
+      pointer-events: none;
+    }
+    #customViewer {
+      z-index: 2;
+      pointer-events: none;
+    }
+    #rawCanvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: none;
+      z-index: 0;
+      image-rendering: pixelated;
+      cursor: grab;
+    }
+    #rawCanvas.dragging {
+      cursor: grabbing;
+    }
+    .panel {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: min(430px, calc(100vw - 24px));
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--panel-border);
+      background: var(--panel-bg);
+      backdrop-filter: blur(6px);
+      z-index: 3;
+    }
+    .title {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+      letter-spacing: 0.2px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .row:last-child {
+      margin-bottom: 0;
+    }
+    button, input[type="range"] {
+      accent-color: var(--accent);
+    }
+    button {
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: rgba(255, 255, 255, 0.14);
+    }
+    input[type="range"] {
+      width: 170px;
+    }
+    label {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .status {
+      font-size: 12px;
+      line-height: 1.3;
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+<div id="viewerStack">
+  <div id="liveStack">
+    <div id="liveViewerA" class="viewerLayer"></div>
+    <div id="liveViewerB" class="viewerLayer"></div>
+  </div>
+  <div id="customViewer" class="viewerLayer"></div>
+</div>
+<canvas id="rawCanvas"></canvas>
+
+<div class="panel">
+  <h1 class="title">PanShot 360 Compare</h1>
+  <div class="row">
+    <button id="loadButton" type="button">Load Vanilla Cubemap</button>
+    <button id="resetView" type="button">Reset View</button>
+    <input id="fileInput" type="file" accept="image/*" multiple hidden>
+  </div>
+  <div class="row">
+    <label for="blend">Blend</label>
+    <input id="blend" type="range" min="0" max="100" value="50">
+    <span id="blendValue" class="hint">50%</span>
+  </div>
+  <div class="row">
+    <label><input id="flipToggle" type="checkbox"> Flip A/B</label>
+    <span id="viewValue" class="hint">FOV: 90</span>
+  </div>
+  <div class="row">
+    <label><input id="rawToggle" type="checkbox"> Raw Atlas</label>
+    <span class="hint">Exact stitched pixels, no 360 reprojection.</span>
+  </div>
+  <div id="status" class="status">Connecting to panorama stream...</div>
+  <div class="hint">360 mode: drag to pan, wheel to zoom. Raw mode: drag/zoom exact atlas.</div>
+</div>
+
+<script src="https://unpkg.com/@egjs/view360@3.6.4/dist/view360.pkgd.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  const FACE_GRID = [
+    { col: 1, row: 1 }, // 0
+    { col: 1, row: 0 }, // 1
+    { col: 2, row: 1 }, // 2
+    { col: 0, row: 0 }, // 3
+    { col: 2, row: 0 }, // 4
+    { col: 0, row: 1 }  // 5
+  ];
+
+  const viewerStack = document.getElementById("viewerStack");
+  const liveStack = document.getElementById("liveStack");
+  const liveContainerA = document.getElementById("liveViewerA");
+  const liveContainerB = document.getElementById("liveViewerB");
+  const customContainer = document.getElementById("customViewer");
+  const rawCanvas = document.getElementById("rawCanvas");
+  const rawCtx = rawCanvas.getContext("2d");
+  const loadButton = document.getElementById("loadButton");
+  const fileInput = document.getElementById("fileInput");
+  const blendSlider = document.getElementById("blend");
+  const blendValue = document.getElementById("blendValue");
+  const flipToggle = document.getElementById("flipToggle");
+  const rawToggle = document.getElementById("rawToggle");
+  const statusEl = document.getElementById("status");
+  const viewValue = document.getElementById("viewValue");
+  const resetViewButton = document.getElementById("resetView");
+
+  const PanoViewer = window.eg && window.eg.view360 ? window.eg.view360.PanoViewer : null;
+  const CUBEMAP_PROJECTION = PanoViewer && PanoViewer.PROJECTION_TYPE
+    ? PanoViewer.PROJECTION_TYPE.CUBEMAP
+    : "cubemap";
+
+  let liveViewerA = null;
+  let liveViewerB = null;
+  let activeLiveViewer = null;
+  let standbyLiveViewer = null;
+  let activeLiveContainer = null;
+  let standbyLiveContainer = null;
+  let pendingSwapViewer = null;
+  let pendingSwapView = null;
+  let customViewer = null;
+  let liveAtlasImage = null;
+  let liveAtlasCanvas = null;
+  let customAtlasCanvas = null;
+  let customLoaded = false;
+  let lastLiveTimestamp = 0;
+  let liveRequestToken = 0;
+  let liveViewerInitialized = false;
+
+  let rawZoom = 1;
+  let rawPanX = 0;
+  let rawPanY = 0;
+  let rawDragging = false;
+  let rawLastX = 0;
+  let rawLastY = 0;
+  let nearestPatchInstalled = false;
+
+  function installNearestTexturePatch() {
+    if (nearestPatchInstalled) {
+      return;
+    }
+    nearestPatchInstalled = true;
+
+    function patchPrototype(proto) {
+      if (!proto || proto.__spectatorcamNearestPatched) {
+        return;
+      }
+      proto.__spectatorcamNearestPatched = true;
+
+      const originalTexParameteri = proto.texParameteri;
+      if (typeof originalTexParameteri === "function") {
+        proto.texParameteri = function (target, pname, param) {
+          if (pname === this.TEXTURE_MIN_FILTER || pname === this.TEXTURE_MAG_FILTER) {
+            param = this.NEAREST;
+          }
+          return originalTexParameteri.call(this, target, pname, param);
+        };
+      }
+
+      const originalTexParameterf = proto.texParameterf;
+      if (typeof originalTexParameterf === "function") {
+        proto.texParameterf = function (target, pname, param) {
+          if (pname === this.TEXTURE_MIN_FILTER || pname === this.TEXTURE_MAG_FILTER) {
+            param = this.NEAREST;
+          }
+          return originalTexParameterf.call(this, target, pname, param);
+        };
+      }
+    }
+
+    patchPrototype(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype);
+    patchPrototype(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype);
+  }
+
+  function makeEmptyCubemapDataUrl() {
+    const canvas = document.createElement("canvas");
+    canvas.width = 6;
+    canvas.height = 4;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/png");
+  }
+
+  function updateBlendLabel() {
+    blendValue.textContent = blendSlider.value + "%";
+  }
+
+  function updateLiveLayerVisibility() {
+    if (activeLiveContainer) {
+      activeLiveContainer.style.opacity = "1";
+      activeLiveContainer.style.zIndex = "2";
+      activeLiveContainer.style.pointerEvents = "auto";
+    }
+    if (standbyLiveContainer) {
+      standbyLiveContainer.style.opacity = "0";
+      standbyLiveContainer.style.zIndex = "1";
+      standbyLiveContainer.style.pointerEvents = "none";
+    }
+  }
+
+  function setActiveLiveViewer(viewer, container) {
+    activeLiveViewer = viewer;
+    activeLiveContainer = container;
+    if (viewer === liveViewerA) {
+      standbyLiveViewer = liveViewerB;
+      standbyLiveContainer = liveContainerB;
+    } else {
+      standbyLiveViewer = liveViewerA;
+      standbyLiveContainer = liveContainerA;
+    }
+    updateLiveLayerVisibility();
+  }
+
+  function getActiveLiveViewer() {
+    return activeLiveViewer;
+  }
+
+  function getLiveView() {
+    const liveViewer = getActiveLiveViewer();
+    if (!liveViewer) {
+      return { yaw: 0, pitch: 0, fov: 90 };
+    }
+    return {
+      yaw: liveViewer.getYaw(),
+      pitch: liveViewer.getPitch(),
+      fov: liveViewer.getFov()
+    };
+  }
+
+  function updateViewLabel() {
+    if (rawToggle.checked) {
+      viewValue.textContent = "Zoom: " + rawZoom + "x";
+      return;
+    }
+    const fov = getLiveView().fov;
+    viewValue.textContent = "FOV: " + Math.round(fov);
+  }
+
+  function imageToCanvas(image) {
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth || image.width;
+    canvas.height = image.naturalHeight || image.height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0);
+    return canvas;
+  }
+
+  function parseFaceIndex(name) {
+    const match = name.match(/(?:^|[_-])([0-5])(?:\.[^.]+)?$/);
+    return match ? Number(match[1]) : -1;
+  }
+
+  function loadImageFromUrl(url) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Failed to load image: " + url));
+      image.src = url;
+    });
+  }
+
+  function loadImageFromFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error("Failed to decode image: " + file.name));
+        image.src = reader.result;
+      };
+      reader.onerror = () => reject(new Error("Failed to read image: " + file.name));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function cubemapCanvasFromFiles(files) {
+    const list = Array.from(files);
+    if (list.length === 1) {
+      return imageToCanvas(await loadImageFromFile(list[0]));
+    }
+
+    if (list.length !== 6) {
+      throw new Error("Load one stitched cubemap image or exactly six face images.");
+    }
+
+    const entries = list.map(file => ({ file, index: parseFaceIndex(file.name) }));
+    const allNamed = entries.every(entry => entry.index >= 0);
+    if (!allNamed) {
+      entries.sort((a, b) => a.file.name.localeCompare(b.file.name));
+      for (let i = 0; i < entries.length; i++) {
+        entries[i].index = i;
+      }
+    }
+
+    const imagesByFace = new Array(6);
+    for (const entry of entries) {
+      if (entry.index < 0 || entry.index > 5) {
+        throw new Error("Could not map face file: " + entry.file.name);
+      }
+      imagesByFace[entry.index] = await loadImageFromFile(entry.file);
+    }
+
+    for (let i = 0; i < 6; i++) {
+      if (!imagesByFace[i]) {
+        throw new Error("Missing face index " + i + " in selected files.");
+      }
+    }
+
+    const faceSize = imagesByFace[0].naturalWidth || imagesByFace[0].width;
+    const stitchedCanvas = document.createElement("canvas");
+    stitchedCanvas.width = faceSize * 3;
+    stitchedCanvas.height = faceSize * 2;
+    const stitchedCtx = stitchedCanvas.getContext("2d");
+
+    for (let face = 0; face < 6; face++) {
+      const grid = FACE_GRID[face];
+      stitchedCtx.drawImage(
+        imagesByFace[face],
+        grid.col * faceSize,
+        grid.row * faceSize,
+        faceSize,
+        faceSize
+      );
+    }
+
+    return stitchedCanvas;
+  }
+
+  function applyViewerBlend() {
+    const alpha = Math.max(0, Math.min(1, Number(blendSlider.value) / 100));
+    if (!customLoaded || !customAtlasCanvas) {
+      liveStack.style.zIndex = "2";
+      liveStack.style.opacity = "1";
+      customContainer.style.zIndex = "1";
+      customContainer.style.opacity = "0";
+      return;
+    }
+
+    if (flipToggle.checked) {
+      customContainer.style.zIndex = "1";
+      customContainer.style.opacity = "1";
+      liveStack.style.zIndex = "2";
+      liveStack.style.opacity = String(alpha);
+    } else {
+      liveStack.style.zIndex = "1";
+      liveStack.style.opacity = "1";
+      customContainer.style.zIndex = "2";
+      customContainer.style.opacity = String(alpha);
+    }
+  }
+
+  function setViewerAtlas(viewer, atlasCanvas, preserveView) {
+    if (!viewer || !atlasCanvas) {
+      return;
+    }
+    const view = preserveView ? getLiveView() : null;
+    viewer.setImage(atlasCanvas.toDataURL("image/png"), {
+      projectionType: CUBEMAP_PROJECTION
+    });
+    if (view) {
+      requestAnimationFrame(() => viewer.lookAt(view, 0));
+    }
+  }
+
+  function setLiveViewerImage(image, view) {
+    if (!image) {
+      return;
+    }
+
+    if (!standbyLiveViewer) {
+      const activeViewer = getActiveLiveViewer();
+      if (!activeViewer) {
+        return;
+      }
+      activeViewer.setImage(image, {
+        projectionType: CUBEMAP_PROJECTION
+      });
+      if (view) {
+        requestAnimationFrame(() => activeViewer.lookAt(view, 0));
+      }
+      return;
+    }
+
+    pendingSwapViewer = standbyLiveViewer;
+    pendingSwapView = view || getLiveView();
+    standbyLiveViewer.setImage(image, {
+      projectionType: CUBEMAP_PROJECTION
+    });
+  }
+
+  function handleLiveViewChange(sourceViewer, event) {
+    if (sourceViewer !== getActiveLiveViewer()) {
+      return;
+    }
+    if (customViewer) {
+      customViewer.lookAt({ yaw: event.yaw, pitch: event.pitch, fov: event.fov }, 0);
+    }
+    if (!rawToggle.checked) {
+      viewValue.textContent = "FOV: " + Math.round(event.fov);
+    }
+  }
+
+  function handleLiveViewerReady(sourceViewer, sourceContainer) {
+    if (pendingSwapViewer && sourceViewer === pendingSwapViewer) {
+      if (pendingSwapView) {
+        sourceViewer.lookAt(pendingSwapView, 0);
+      }
+      setActiveLiveViewer(sourceViewer, sourceContainer);
+      pendingSwapViewer = null;
+      pendingSwapView = null;
+      liveViewerInitialized = true;
+      syncCustomToLive();
+      updateViewLabel();
+      return;
+    }
+
+    if (!liveViewerInitialized && sourceViewer === getActiveLiveViewer()) {
+      sourceViewer.lookAt({ yaw: 0, pitch: 0, fov: 90 }, 0);
+      liveViewerInitialized = true;
+      syncCustomToLive();
+      updateViewLabel();
+      return;
+    }
+
+    if (sourceViewer === getActiveLiveViewer()) {
+      syncCustomToLive();
+      updateViewLabel();
+    }
+  }
+
+  function getLiveAtlasCanvas() {
+    if (!liveAtlasCanvas && liveAtlasImage) {
+      liveAtlasCanvas = imageToCanvas(liveAtlasImage);
+    }
+    return liveAtlasCanvas;
+  }
+
+  function syncCustomToLive() {
+    if (!getActiveLiveViewer() || !customViewer) {
+      return;
+    }
+    customViewer.lookAt(getLiveView(), 0);
+  }
+
+  function drawRawAtlas() {
+    if (!rawToggle.checked) {
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const targetWidth = Math.max(1, Math.floor(window.innerWidth * dpr));
+    const targetHeight = Math.max(1, Math.floor(window.innerHeight * dpr));
+    if (rawCanvas.width !== targetWidth || rawCanvas.height !== targetHeight) {
+      rawCanvas.width = targetWidth;
+      rawCanvas.height = targetHeight;
+    }
+
+    rawCtx.imageSmoothingEnabled = false;
+    rawCtx.fillStyle = "#0b0e16";
+    rawCtx.fillRect(0, 0, rawCanvas.width, rawCanvas.height);
+
+    const liveCanvas = getLiveAtlasCanvas();
+    const base = liveCanvas || customAtlasCanvas;
+    if (!base) {
+      return;
+    }
+
+    const blendAlpha = Math.max(0, Math.min(1, Number(blendSlider.value) / 100));
+    let lower = base;
+    let upper = null;
+    let upperAlpha = 0;
+
+    if (customLoaded && customAtlasCanvas && liveCanvas) {
+      if (flipToggle.checked) {
+        lower = customAtlasCanvas;
+        upper = liveCanvas;
+      } else {
+        lower = liveCanvas;
+        upper = customAtlasCanvas;
+      }
+      upperAlpha = blendAlpha;
+    }
+
+    const drawWidth = lower.width * rawZoom;
+    const drawHeight = lower.height * rawZoom;
+    const drawX = Math.floor((rawCanvas.width - drawWidth) * 0.5 + rawPanX);
+    const drawY = Math.floor((rawCanvas.height - drawHeight) * 0.5 + rawPanY);
+
+    rawCtx.globalAlpha = 1;
+    rawCtx.drawImage(lower, drawX, drawY, drawWidth, drawHeight);
+    if (upper && upperAlpha > 0) {
+      rawCtx.globalAlpha = upperAlpha;
+      rawCtx.drawImage(upper, drawX, drawY, drawWidth, drawHeight);
+      rawCtx.globalAlpha = 1;
+    }
+  }
+
+  function applyModeVisibility() {
+    if (rawToggle.checked) {
+      viewerStack.style.display = "none";
+      rawCanvas.style.display = "block";
+      drawRawAtlas();
+    } else {
+      rawCanvas.style.display = "none";
+      viewerStack.style.display = "block";
+    }
+    updateViewLabel();
+  }
+
+  async function refreshLiveCubemap(timestamp) {
+    const token = ++liveRequestToken;
+    const preservedView = getLiveView();
+    const image = await loadImageFromUrl("/live-cubemap.png?ts=" + timestamp);
+    if (token !== liveRequestToken) {
+      return;
+    }
+    liveAtlasImage = image;
+    liveAtlasCanvas = rawToggle.checked ? imageToCanvas(image) : null;
+    setLiveViewerImage(image, preservedView);
+    applyViewerBlend();
+    drawRawAtlas();
+  }
+
+  async function pollState() {
+    try {
+      const response = await fetch("/api/state", { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error("State request failed: " + response.status);
+      }
+      const state = await response.json();
+      statusEl.textContent = "Running: " + state.running + " | Cubemap available: " + state.available + " | Last update: " + state.lastModified;
+      if (state.available && state.lastModified > 0 && state.lastModified !== lastLiveTimestamp) {
+        lastLiveTimestamp = state.lastModified;
+        await refreshLiveCubemap(lastLiveTimestamp);
+      }
+    } catch (error) {
+      statusEl.textContent = "State error: " + error.message;
+    }
+    setTimeout(pollState, 1000);
+  }
+
+  function initViewers() {
+    if (!PanoViewer) {
+      statusEl.textContent = "Viewer error: @egjs/view360 failed to load.";
+      return;
+    }
+
+    installNearestTexturePatch();
+
+    const emptyCubemap = makeEmptyCubemapDataUrl();
+    const sharedOptions = {
+      image: emptyCubemap,
+      projectionType: CUBEMAP_PROJECTION,
+      fovRange: [1, 150],
+      pitchRange: [-120, 120],
+      gyroMode: PanoViewer.GYRO_MODE.NONE
+    };
+
+    liveViewerA = new PanoViewer(liveContainerA, sharedOptions);
+    liveViewerB = new PanoViewer(liveContainerB, sharedOptions);
+    customViewer = new PanoViewer(customContainer, sharedOptions);
+    setActiveLiveViewer(liveViewerA, liveContainerA);
+
+    liveViewerA.on("viewChange", event => handleLiveViewChange(liveViewerA, event));
+    liveViewerB.on("viewChange", event => handleLiveViewChange(liveViewerB, event));
+
+    liveViewerA.on("ready", () => handleLiveViewerReady(liveViewerA, liveContainerA));
+    liveViewerB.on("ready", () => handleLiveViewerReady(liveViewerB, liveContainerB));
+
+    customViewer.on("ready", () => {
+      syncCustomToLive();
+    });
+  }
+
+  loadButton.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", async () => {
+    if (!fileInput.files || fileInput.files.length === 0) {
+      return;
+    }
+    try {
+      customAtlasCanvas = await cubemapCanvasFromFiles(fileInput.files);
+      customLoaded = true;
+      setViewerAtlas(customViewer, customAtlasCanvas, true);
+      syncCustomToLive();
+      applyViewerBlend();
+      drawRawAtlas();
+    } catch (error) {
+      statusEl.textContent = "Custom cubemap error: " + error.message;
+    } finally {
+      fileInput.value = "";
+    }
+  });
+
+  blendSlider.addEventListener("input", () => {
+    updateBlendLabel();
+    applyViewerBlend();
+    drawRawAtlas();
+  });
+
+  flipToggle.addEventListener("change", () => {
+    applyViewerBlend();
+    drawRawAtlas();
+  });
+
+  rawToggle.addEventListener("change", () => {
+    rawZoom = 1;
+    rawPanX = 0;
+    rawPanY = 0;
+    applyModeVisibility();
+  });
+
+  resetViewButton.addEventListener("click", () => {
+    const liveViewer = getActiveLiveViewer();
+    if (!rawToggle.checked && liveViewer) {
+      liveViewer.lookAt({ yaw: 0, pitch: 0, fov: 90 }, 0);
+      syncCustomToLive();
+    }
+    rawZoom = 1;
+    rawPanX = 0;
+    rawPanY = 0;
+    updateViewLabel();
+    drawRawAtlas();
+  });
+
+  rawCanvas.addEventListener("mousedown", event => {
+    if (!rawToggle.checked || event.button !== 0) {
+      return;
+    }
+    rawDragging = true;
+    rawLastX = event.clientX;
+    rawLastY = event.clientY;
+    rawCanvas.classList.add("dragging");
+  });
+
+  window.addEventListener("mouseup", () => {
+    rawDragging = false;
+    rawCanvas.classList.remove("dragging");
+  });
+
+  window.addEventListener("mousemove", event => {
+    if (!rawToggle.checked || !rawDragging) {
+      return;
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const dx = event.clientX - rawLastX;
+    const dy = event.clientY - rawLastY;
+    rawLastX = event.clientX;
+    rawLastY = event.clientY;
+    rawPanX += dx * dpr;
+    rawPanY += dy * dpr;
+    drawRawAtlas();
+  });
+
+  rawCanvas.addEventListener("wheel", event => {
+    if (!rawToggle.checked) {
+      return;
+    }
+    event.preventDefault();
+    const dpr = window.devicePixelRatio || 1;
+    const mouseX = event.clientX * dpr;
+    const mouseY = event.clientY * dpr;
+    const previousZoom = rawZoom;
+    if (event.deltaY < 0) {
+      rawZoom = Math.min(8, rawZoom + 1);
+    } else if (event.deltaY > 0) {
+      rawZoom = Math.max(1, rawZoom - 1);
+    }
+    if (rawZoom !== previousZoom) {
+      const centerX = rawCanvas.width * 0.5 + rawPanX;
+      const centerY = rawCanvas.height * 0.5 + rawPanY;
+      const sourceX = (mouseX - centerX) / previousZoom;
+      const sourceY = (mouseY - centerY) / previousZoom;
+      rawPanX = mouseX - rawCanvas.width * 0.5 - sourceX * rawZoom;
+      rawPanY = mouseY - rawCanvas.height * 0.5 - sourceY * rawZoom;
+      updateViewLabel();
+      drawRawAtlas();
+    }
+  }, { passive: false });
+
+  window.addEventListener("resize", () => {
+    drawRawAtlas();
+  });
+
+  viewerStack.addEventListener("wheel", event => {
+    const liveViewer = getActiveLiveViewer();
+    if (rawToggle.checked || !liveViewer) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const view = getLiveView();
+    const step = event.ctrlKey ? 0.5 : 2.0;
+    let targetFov = view.fov;
+    if (event.deltaY < 0) {
+      targetFov -= step;
+    } else if (event.deltaY > 0) {
+      targetFov += step;
+    }
+    targetFov = Math.max(1, Math.min(150, targetFov));
+
+    liveViewer.lookAt({ yaw: view.yaw, pitch: view.pitch, fov: targetFov }, 0);
+    syncCustomToLive();
+    updateViewLabel();
+  }, { passive: false, capture: true });
+
+  updateBlendLabel();
+  initViewers();
+  applyViewerBlend();
+  applyModeVisibility();
+  pollState();
+})();
+</script>
+</body>
+</html>
