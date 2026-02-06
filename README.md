@@ -8,6 +8,4 @@ Essentially works like n00bbot, except it works entirely on the client side.
 
 Supports custom resource packs, render distance, entities, player rendering and cubemap export.
 
-Currently only made for 1.21 but other versions may be supported in the future.
-
-Vibecoded, of course, but works fine. Message me if you find any bugs!
+Vibecoded, of course, but works fine. Submit an issue or contact me on Discord if you find any bugs!
