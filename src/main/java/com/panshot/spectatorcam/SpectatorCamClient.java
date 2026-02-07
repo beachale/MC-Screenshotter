@@ -341,10 +341,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         LiteralArgumentBuilder<FabricClientCommandSource> singleFovCommand = literal("fov")
             .executes(context -> SINGLE_CONTROLLER.fovStatus(context.getSource().getClient()))
-            .then(argument("degrees", IntegerArgumentType.integer(1, 179))
+            .then(argument("degrees", DoubleArgumentType.doubleArg(1.0, 179.0))
                 .executes(context -> SINGLE_CONTROLLER.setFov(
                     context.getSource().getClient(),
-                    IntegerArgumentType.getInteger(context, "degrees")
+                    DoubleArgumentType.getDouble(context, "degrees")
                 )));
 
         LiteralArgumentBuilder<FabricClientCommandSource> singleRenderPlayerCommand = literal("renderplayer")
@@ -1241,9 +1241,9 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private static final int DEFAULT_SINGLE_HEIGHT = 1024;
         private static final int MIN_SINGLE_DIMENSION = 64;
         private static final int MAX_SINGLE_DIMENSION = 4096;
-        private static final int DEFAULT_SINGLE_FOV = 90;
-        private static final int MIN_SINGLE_FOV = 1;
-        private static final int MAX_SINGLE_FOV = 179;
+        private static final double DEFAULT_SINGLE_FOV = 90.0;
+        private static final double MIN_SINGLE_FOV = 1.0;
+        private static final double MAX_SINGLE_FOV = 179.0;
 
         private volatile boolean running;
         private long tickCounter;
@@ -1262,7 +1262,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private SimpleFramebuffer singleRenderFramebuffer;
         private int captureWidth = DEFAULT_SINGLE_WIDTH;
         private int captureHeight = DEFAULT_SINGLE_HEIGHT;
-        private int captureFov = DEFAULT_SINGLE_FOV;
+        private double captureFov = DEFAULT_SINGLE_FOV;
         private volatile boolean renderPlayerEnabled;
         private volatile byte[] latestImageBytes;
         private volatile long latestImageTimestamp;
@@ -1342,7 +1342,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             send(client, String.format(
                 Locale.ROOT,
-                "Single preview started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, %dx%d, fov %d, renderplayer %s).",
+                "Single preview started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, %dx%d, fov %s, renderplayer %s).",
                 x,
                 y,
                 z,
@@ -1351,7 +1351,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 this.pitch,
                 captureWidth,
                 captureHeight,
-                captureFov,
+                formatFov(captureFov),
                 renderPlayerEnabled ? "on" : "off"
             ));
             return 1;
@@ -1378,7 +1378,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             double seconds = Math.max(0.0, (nextCaptureTick - tickCounter) / 20.0);
             send(client, String.format(
                 Locale.ROOT,
-                "Running: next frame in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, frames %d, %dx%d, fov %d, renderplayer %s).",
+                "Running: next frame in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, frames %d, %dx%d, fov %s, renderplayer %s).",
                 seconds,
                 origin.x,
                 origin.y,
@@ -1388,7 +1388,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 completedCaptures,
                 captureWidth,
                 captureHeight,
-                captureFov,
+                formatFov(captureFov),
                 renderPlayerEnabled ? "on" : "off"
             ));
             return 1;
@@ -1417,13 +1417,13 @@ public final class SpectatorCamClient implements ClientModInitializer {
         }
 
         private int fovStatus(MinecraftClient client) {
-            send(client, String.format(Locale.ROOT, "Single preview FOV is %d.", captureFov));
+            send(client, String.format(Locale.ROOT, "Single preview FOV is %s.", formatFov(captureFov)));
             return 1;
         }
 
-        private int setFov(MinecraftClient client, int fov) {
+        private int setFov(MinecraftClient client, double fov) {
             captureFov = clampFov(fov);
-            send(client, String.format(Locale.ROOT, "Single preview FOV set to %d.", captureFov));
+            send(client, String.format(Locale.ROOT, "Single preview FOV set to %s.", formatFov(captureFov)));
             return 1;
         }
 
@@ -1447,7 +1447,9 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private RenderContext beginSingleRender(MinecraftClient client) {
             int width = captureWidth;
             int height = captureHeight;
-            int targetFov = captureFov;
+            double targetFov = captureFov;
+            int targetBaseFov = clampFovInteger((int)Math.round(targetFov));
+            float targetFovScale = (float)(targetFov / (double)targetBaseFov);
             ensureFramebuffers(width, height);
 
             MinecraftClientAccessor clientAccessor = (MinecraftClientAccessor)client;
@@ -1479,9 +1481,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             client.setCameraEntity(singleEntity);
             client.options.setPerspective(Perspective.FIRST_PERSON);
-            client.options.getFov().setValue(targetFov);
+            client.options.getFov().setValue(targetBaseFov);
             client.options.hudHidden = true;
             gameRendererAccessor.spectatorcam$setRenderBlockOutline(false);
+            gameRendererAccessor.spectatorcam$setFovScale(targetFovScale);
+            gameRendererAccessor.spectatorcam$setOldFovScale(targetFovScale);
             client.gameRenderer.setRenderingPanorama(false);
             if (renderPlayerEnabled && client.player != null && client.world != null) {
                 removeEntityIfPresent(client.world, SINGLE_RENDER_PLAYER_ENTITY_ID);
@@ -1656,8 +1660,24 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return Math.max(MIN_SINGLE_DIMENSION, Math.min(MAX_SINGLE_DIMENSION, value));
         }
 
-        private int clampFov(int fov) {
+        private double clampFov(double fov) {
             return Math.max(MIN_SINGLE_FOV, Math.min(MAX_SINGLE_FOV, fov));
+        }
+
+        private int clampFovInteger(int fov) {
+            return Math.max((int)MIN_SINGLE_FOV, Math.min((int)MAX_SINGLE_FOV, fov));
+        }
+
+        private String formatFov(double fov) {
+            String text = String.format(Locale.ROOT, "%.5f", fov);
+            int end = text.length();
+            while (end > 0 && text.charAt(end - 1) == '0') {
+                end--;
+            }
+            if (end > 0 && text.charAt(end - 1) == '.') {
+                end--;
+            }
+            return text.substring(0, end);
         }
 
         private void ensureSingleEntity(ClientWorld world) {
