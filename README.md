@@ -22,6 +22,9 @@ Usage
 For a panorama recreation setup for e.g. 26.1, use this setup:
 Make sure to let go of mouse to prevent misaligning the camera
 `/tp @s -255.5281246385249 126 -2006.420387290336 -271.80280706639144 0`
+
 `/panshot panorama resolution 4096`
+
 `/panshot panorama downscale 4 faces box`
+
 `/panshot panorama every 1`
