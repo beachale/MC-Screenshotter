@@ -23,23 +23,15 @@ Usage
 
 Panorama resolution syntax:
 
-/panshot panorama resolution <size>
+--------------------------------------------------------------
 
-- `size`: square face size in pixels (`16` to `8192`), e.g. `512`, `1024`, `2048`.
-- Example supersample workflow: set `resolution 2048`, then `/panshot panorama downscale 2 faces supersample` to produce `1024x1024` faces from supersampled captures.
+For a panorama recreation setup for e.g. 26.1, use this setup:
+Make sure to let go of mouse to prevent misaligning the camera
 
-Downscale syntax:
+`/tp @s -255.5281246385249 126 -2006.420387290336 -271.80280706639144 0`
 
-/panshot panorama downscale <factor> [stage] [interpolation]
+`/panshot panorama resolution 4096`
 
-- `factor`: `1.0` disables scaling, values `> 1.0` downscale.
-- `stage`: `faces` (before stitching) or `cubemap` (after stitching, default).
-- `interpolation`: `nearest`, `bilinear`, `bicubic` (or `cubic`), `supersample`, `box`.
+`/panshot panorama downscale 4 faces box`
 
-Nudge syntax:
-
-/panshot panorama nudge <distance>
-
-- Applies a per-face offset along that face camera direction before capture.
-- Example: with `0.05`, face 0/1/2/3 are nudged forward in each cardinal direction, face 4 nudges up, face 5 nudges down.
-- Use `/panshot panorama nudge off` to disable.
+`/panshot panorama every 1`
