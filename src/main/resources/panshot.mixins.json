@@ -4,6 +4,7 @@
   "package": "com.panshot.spectatorcam.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
+    "CameraMixin",
     "GameRendererAccessor",
     "MinecraftClientAccessor",
     "WindowAccessor"

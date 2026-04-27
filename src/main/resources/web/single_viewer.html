@@ -45,9 +45,18 @@
       padding: 12px;
       border-radius: 12px;
       border: 1px solid var(--panel-border);
-      background: var(--panel-bg);
-      backdrop-filter: blur(6px);
+      background: rgba(18, 20, 28, 0.34);
+      opacity: 0.38;
+      backdrop-filter: blur(2px);
+      transition: opacity 160ms ease, background 160ms ease, border-color 160ms ease, backdrop-filter 160ms ease;
       z-index: 2;
+    }
+    .panel:hover,
+    .panel:focus-within {
+      border-color: var(--panel-border);
+      background: var(--panel-bg);
+      opacity: 1;
+      backdrop-filter: blur(6px);
     }
     .title {
       margin: 0 0 8px 0;
@@ -103,6 +112,13 @@
       font-size: 12px;
       color: var(--muted);
     }
+    @media (hover: none) {
+      .panel {
+        background: var(--panel-bg);
+        opacity: 0.82;
+        backdrop-filter: blur(6px);
+      }
+    }
   </style>
 </head>
 <body>
@@ -156,6 +172,7 @@
   let liveRequestToken = 0;
   let lastState = null;
   let autoFlipTimer = null;
+  let pollStateTimer = null;
 
   let centerX = 0;
   let centerY = 0;
@@ -353,6 +370,12 @@
   }
 
   async function pollState() {
+    pollStateTimer = null;
+    if (document.hidden) {
+      schedulePollState(1000);
+      return;
+    }
+
     try {
       const response = await fetch("/api/state", { cache: "no-store" });
       if (!response.ok) {
@@ -370,7 +393,14 @@
     } catch (error) {
       updateStatusText(error.message);
     }
-    setTimeout(pollState, 1000);
+    schedulePollState(1000);
+  }
+
+  function schedulePollState(delayMs) {
+    if (pollStateTimer !== null) {
+      clearTimeout(pollStateTimer);
+    }
+    pollStateTimer = setTimeout(pollState, delayMs);
   }
 
   function applyAutoFlip() {
@@ -489,12 +519,17 @@
   }, { passive: false });
 
   window.addEventListener("resize", requestRedraw);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      schedulePollState(0);
+    }
+  });
 
   updateOpacityLabel();
   updateZoomLabel();
   updateStatusText(null);
   requestRedraw();
-  pollState();
+  schedulePollState(0);
 })();
 </script>
 </body>

@@ -15,6 +15,8 @@ Usage
 
 /panshot single every 5
 
+/panshot single downscale 2 faces box
+
 /panshot panorama downscale 2.0 cubemap bicubic
 
 /panshot panorama resolution 2048

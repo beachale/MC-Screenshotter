@@ -11,6 +11,9 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
+import com.mojang.brigadier.suggestion.SuggestionProvider;
+import com.mojang.brigadier.suggestion.Suggestions;
+import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 import com.panshot.spectatorcam.mixin.GameRendererAccessor;
 import com.panshot.spectatorcam.mixin.MinecraftClientAccessor;
 import com.panshot.spectatorcam.mixin.WindowAccessor;
@@ -31,6 +34,8 @@ import net.minecraft.client.util.ScreenshotRecorder;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityPose;
+import net.minecraft.entity.player.SkinTextures;
 import net.minecraft.text.ClickEvent;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.Vec3d;
@@ -48,6 +53,7 @@ import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import javax.imageio.ImageIO;
@@ -59,6 +65,16 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static final String MESSAGE_PREFIX = "[PanShot] ";
     private static final double DEFAULT_PANORAMA_INTERVAL_SECONDS = 10.0;
     private static final double DEFAULT_SINGLE_INTERVAL_SECONDS = 1.0;
+    private static final double MIN_DOWNSCALE_FACTOR = 1.0;
+    private static final String[] INTERVAL_SUGGESTIONS = {"0.1", "0.5", "1", "2", "5", "10", "30", "60"};
+    private static final String[] DOWNSCALE_FACTOR_SUGGESTIONS = {"1", "1.5", "2", "3", "4", "6", "8", "16"};
+    private static final String[] PANORAMA_STAGE_SUGGESTIONS = {"faces", "cubemap"};
+    private static final String[] SINGLE_STAGE_SUGGESTIONS = {"image", "faces", "cubemap"};
+    private static final String[] DOWNSCALE_INTERPOLATION_SUGGESTIONS = {"nearest", "bilinear", "bicubic", "box", "supersample"};
+    private static final String[] PANORAMA_RESOLUTION_SUGGESTIONS = {"512", "1024", "2048", "4096", "8192"};
+    private static final String[] SINGLE_RESOLUTION_SUGGESTIONS = {"256", "512", "1024", "1920", "2048", "3840", "4096"};
+    private static final String[] FOV_SUGGESTIONS = {"30", "45", "60", "70", "90", "110", "120"};
+    private static final String[] NUDGE_SUGGESTIONS = {"-0.1", "-0.05", "0.05", "0.1", "0.25", "0.5"};
     private static final UUID CAMERA_PROFILE_ID = UUID.fromString("f0d6643c-af19-4e1e-948d-a5d2d7e2f27b");
     private static final PanoramaWebServer PANORAMA_WEB_SERVER = new PanoramaWebServer();
     private static final SinglePreviewWebServer SINGLE_WEB_SERVER = new SinglePreviewWebServer();
@@ -84,6 +100,24 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static void registerCommands(CommandDispatcher<FabricClientCommandSource> dispatcher) {
         dispatcher.register(buildRootCommand("panshot"));
     }
+
+    public static boolean isPanShotCameraEntity(Entity entity) {
+        return entity != null
+            && (CAMERA_CONTROLLER.isCameraEntity(entity)
+                || PANORAMA_CONTROLLER.isCameraEntity(entity)
+                || SINGLE_CONTROLLER.isCameraEntity(entity));
+    }
+
+    private static final SuggestionProvider<FabricClientCommandSource> CURRENT_X_SUGGESTIONS =
+        (context, builder) -> suggestCurrentCoordinate(context.getSource().getClient(), builder, CoordinateSuggestionAxis.X);
+    private static final SuggestionProvider<FabricClientCommandSource> CURRENT_Y_SUGGESTIONS =
+        (context, builder) -> suggestCurrentCoordinate(context.getSource().getClient(), builder, CoordinateSuggestionAxis.Y);
+    private static final SuggestionProvider<FabricClientCommandSource> CURRENT_Z_SUGGESTIONS =
+        (context, builder) -> suggestCurrentCoordinate(context.getSource().getClient(), builder, CoordinateSuggestionAxis.Z);
+    private static final SuggestionProvider<FabricClientCommandSource> CURRENT_YAW_SUGGESTIONS =
+        (context, builder) -> suggestCurrentRotation(context.getSource().getClient(), builder, true);
+    private static final SuggestionProvider<FabricClientCommandSource> CURRENT_PITCH_SUGGESTIONS =
+        (context, builder) -> suggestCurrentRotation(context.getSource().getClient(), builder, false);
 
     private static void takeScreenshotAsyncFast(MinecraftClient client, Framebuffer framebuffer, Consumer<NativeImage> consumer) {
         GpuTexture colorAttachment = framebuffer.getColorAttachment();
@@ -168,7 +202,12 @@ public final class SpectatorCamClient implements ClientModInitializer {
     ) {
         GameProfile sourceProfile = sourcePlayer.getGameProfile();
         GameProfile renderProfile = new GameProfile(profileId, sourceProfile.name(), sourceProfile.properties());
-        OtherClientPlayerEntity renderPlayer = new OtherClientPlayerEntity(world, renderProfile);
+        OtherClientPlayerEntity renderPlayer = new OtherClientPlayerEntity(world, renderProfile) {
+            @Override
+            public SkinTextures getSkin() {
+                return sourcePlayer.getSkin();
+            }
+        };
         renderPlayer.setId(entityId);
         return renderPlayer;
     }
@@ -211,6 +250,52 @@ public final class SpectatorCamClient implements ClientModInitializer {
         }
     }
 
+    private enum CoordinateSuggestionAxis {
+        X,
+        Y,
+        Z
+    }
+
+    private enum DownscaleInterpolation {
+        NEAREST("nearest"),
+        BILINEAR("bilinear"),
+        BICUBIC("bicubic"),
+        BOX("box"),
+        SUPERSAMPLE("supersample");
+
+        private final String label;
+
+        DownscaleInterpolation(String label) {
+            this.label = label;
+        }
+
+        private static DownscaleInterpolation parse(String token) {
+            String normalized = token.toLowerCase(Locale.ROOT);
+            return switch (normalized) {
+                case "nearest", "nearest_neighbor", "nearest-neighbor" -> NEAREST;
+                case "linear", "bilinear" -> BILINEAR;
+                case "cubic", "bicubic" -> BICUBIC;
+                case "box", "area", "boxscale", "box_scaling", "box-scaling" -> BOX;
+                case "supersample", "supersampling", "super", "ssaa" -> SUPERSAMPLE;
+                default -> null;
+            };
+        }
+    }
+
+    private enum SingleDownscaleStage {
+        IMAGE;
+
+        private static SingleDownscaleStage parse(String token) {
+            String normalized = token.toLowerCase(Locale.ROOT);
+            return switch (normalized) {
+                case "image", "single", "frame", "faces", "face", "cubemap", "cube",
+                    "pre", "post", "before", "after", "before_stitch", "after_stitch",
+                    "prestitch", "poststitch" -> IMAGE;
+                default -> null;
+            };
+        }
+    }
+
     private static byte[] encodePngBytes(NativeImage image) throws IOException {
         return encodePngBytes(toBufferedImage(image));
     }
@@ -234,13 +319,250 @@ public final class SpectatorCamClient implements ClientModInitializer {
         return bufferedImage;
     }
 
+    private static int scaledDimension(int sourceDimension, double factor) {
+        if (factor <= MIN_DOWNSCALE_FACTOR) {
+            return sourceDimension;
+        }
+        int scaled = (int)Math.round(sourceDimension / factor);
+        return Math.max(1, Math.min(sourceDimension, scaled));
+    }
+
+    private static BufferedImage resizeBufferedImage(
+        BufferedImage source,
+        int targetWidth,
+        int targetHeight,
+        DownscaleInterpolation interpolation
+    ) {
+        if (source.getWidth() == targetWidth && source.getHeight() == targetHeight) {
+            return source;
+        }
+
+        return switch (interpolation) {
+            case NEAREST -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+            case BILINEAR -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            case BICUBIC -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+            case BOX -> resizeBoxAveraging(source, targetWidth, targetHeight);
+            case SUPERSAMPLE -> resizeSupersample(source, targetWidth, targetHeight);
+        };
+    }
+
+    private static BufferedImage drawResizedImage(BufferedImage source, int targetWidth, int targetHeight, Object interpolationHint) {
+        BufferedImage output = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D graphics = output.createGraphics();
+        try {
+            graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, interpolationHint);
+            graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            graphics.setRenderingHint(RenderingHints.KEY_ALPHA_INTERPOLATION, RenderingHints.VALUE_ALPHA_INTERPOLATION_QUALITY);
+            graphics.drawImage(source, 0, 0, targetWidth, targetHeight, null);
+        } finally {
+            graphics.dispose();
+        }
+        return output;
+    }
+
+    private static BufferedImage resizeSupersample(BufferedImage source, int targetWidth, int targetHeight) {
+        if (targetWidth >= source.getWidth() || targetHeight >= source.getHeight()) {
+            return drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        }
+
+        BufferedImage current = source;
+        boolean currentOwned = false;
+        while (current.getWidth() / 2 >= targetWidth && current.getHeight() / 2 >= targetHeight) {
+            int nextWidth = Math.max(targetWidth, current.getWidth() / 2);
+            int nextHeight = Math.max(targetHeight, current.getHeight() / 2);
+            BufferedImage next = drawResizedImage(current, nextWidth, nextHeight, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            if (currentOwned) {
+                current.flush();
+            }
+            current = next;
+            currentOwned = true;
+        }
+
+        if (current.getWidth() != targetWidth || current.getHeight() != targetHeight) {
+            BufferedImage next = drawResizedImage(current, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+            if (currentOwned) {
+                current.flush();
+            }
+            current = next;
+        }
+
+        return current;
+    }
+
+    private static BufferedImage resizeBoxAveraging(BufferedImage source, int targetWidth, int targetHeight) {
+        if (targetWidth >= source.getWidth() || targetHeight >= source.getHeight()) {
+            return drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        }
+
+        int sourceWidth = source.getWidth();
+        int sourceHeight = source.getHeight();
+        int[] sourcePixels = source.getRGB(0, 0, sourceWidth, sourceHeight, null, 0, sourceWidth);
+        int[] outputPixels = new int[targetWidth * targetHeight];
+
+        double scaleX = (double)sourceWidth / targetWidth;
+        double scaleY = (double)sourceHeight / targetHeight;
+
+        for (int y = 0; y < targetHeight; y++) {
+            double srcY0 = y * scaleY;
+            double srcY1 = srcY0 + scaleY;
+            int minY = (int)Math.floor(srcY0);
+            int maxY = (int)Math.ceil(srcY1);
+            int outputRow = y * targetWidth;
+
+            for (int x = 0; x < targetWidth; x++) {
+                double srcX0 = x * scaleX;
+                double srcX1 = srcX0 + scaleX;
+                int minX = (int)Math.floor(srcX0);
+                int maxX = (int)Math.ceil(srcX1);
+
+                double weightSum = 0.0;
+                double alphaSum = 0.0;
+                double redSum = 0.0;
+                double greenSum = 0.0;
+                double blueSum = 0.0;
+
+                for (int srcY = minY; srcY < maxY; srcY++) {
+                    if (srcY < 0 || srcY >= sourceHeight) {
+                        continue;
+                    }
+                    double yCoverage = pixelCoverage(srcY, srcY0, srcY1);
+                    if (yCoverage <= 0.0) {
+                        continue;
+                    }
+
+                    int sourceRow = srcY * sourceWidth;
+                    for (int srcX = minX; srcX < maxX; srcX++) {
+                        if (srcX < 0 || srcX >= sourceWidth) {
+                            continue;
+                        }
+                        double xCoverage = pixelCoverage(srcX, srcX0, srcX1);
+                        double weight = xCoverage * yCoverage;
+                        if (weight <= 0.0) {
+                            continue;
+                        }
+
+                        int argb = sourcePixels[sourceRow + srcX];
+                        int alpha = (argb >>> 24) & 0xFF;
+                        int red = (argb >>> 16) & 0xFF;
+                        int green = (argb >>> 8) & 0xFF;
+                        int blue = argb & 0xFF;
+
+                        weightSum += weight;
+                        alphaSum += alpha * weight;
+                        redSum += red * weight;
+                        greenSum += green * weight;
+                        blueSum += blue * weight;
+                    }
+                }
+
+                if (weightSum <= 0.0) {
+                    outputPixels[outputRow + x] = 0xFF000000;
+                    continue;
+                }
+
+                int alpha = (int)Math.round(alphaSum / weightSum);
+                int red = (int)Math.round(redSum / weightSum);
+                int green = (int)Math.round(greenSum / weightSum);
+                int blue = (int)Math.round(blueSum / weightSum);
+
+                outputPixels[outputRow + x] =
+                    ((alpha & 0xFF) << 24)
+                        | ((red & 0xFF) << 16)
+                        | ((green & 0xFF) << 8)
+                        | (blue & 0xFF);
+            }
+        }
+
+        BufferedImage output = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB);
+        output.setRGB(0, 0, targetWidth, targetHeight, outputPixels, 0, targetWidth);
+        return output;
+    }
+
+    private static double pixelCoverage(int pixelIndex, double min, double max) {
+        double pixelMin = pixelIndex;
+        double pixelMax = pixelIndex + 1.0;
+        return Math.max(0.0, Math.min(pixelMax, max) - Math.max(pixelMin, min));
+    }
+
+    private static <T> RequiredArgumentBuilder<FabricClientCommandSource, T> withSuggestions(
+        RequiredArgumentBuilder<FabricClientCommandSource, T> builder,
+        String... suggestions
+    ) {
+        return builder.suggests((context, suggestionsBuilder) -> suggestValues(suggestionsBuilder, suggestions));
+    }
+
+    private static <T> RequiredArgumentBuilder<FabricClientCommandSource, T> withSuggestions(
+        RequiredArgumentBuilder<FabricClientCommandSource, T> builder,
+        SuggestionProvider<FabricClientCommandSource> provider
+    ) {
+        return builder.suggests(provider);
+    }
+
+    private static CompletableFuture<Suggestions> suggestValues(SuggestionsBuilder builder, String... values) {
+        String remaining = builder.getRemainingLowerCase();
+        for (String value : values) {
+            if (remaining.isEmpty() || value.toLowerCase(Locale.ROOT).startsWith(remaining)) {
+                builder.suggest(value);
+            }
+        }
+        return builder.buildFuture();
+    }
+
+    private static CompletableFuture<Suggestions> suggestCurrentCoordinate(
+        MinecraftClient client,
+        SuggestionsBuilder builder,
+        CoordinateSuggestionAxis axis
+    ) {
+        if (client.player == null) {
+            return builder.buildFuture();
+        }
+
+        Vec3d eyePos = getStandingPlayerEyePos(client.player);
+        double value = switch (axis) {
+            case X -> eyePos.x;
+            case Y -> eyePos.y;
+            case Z -> eyePos.z;
+        };
+        builder.suggest(formatSuggestedDouble(value));
+        return builder.buildFuture();
+    }
+
+    private static CompletableFuture<Suggestions> suggestCurrentRotation(
+        MinecraftClient client,
+        SuggestionsBuilder builder,
+        boolean yaw
+    ) {
+        if (client.player == null) {
+            return builder.buildFuture();
+        }
+
+        builder.suggest(formatSuggestedDouble(yaw ? client.player.getYaw() : client.player.getPitch()));
+        return builder.buildFuture();
+    }
+
+    private static Vec3d getStandingPlayerEyePos(ClientPlayerEntity player) {
+        return new Vec3d(player.getX(), player.getY() + player.getEyeHeight(EntityPose.STANDING), player.getZ());
+    }
+
+    private static String formatSuggestedDouble(double value) {
+        String text = String.format(Locale.ROOT, "%.5f", value);
+        int end = text.length();
+        while (end > 0 && text.charAt(end - 1) == '0') {
+            end--;
+        }
+        if (end > 0 && text.charAt(end - 1) == '.') {
+            end--;
+        }
+        return text.substring(0, end);
+    }
+
     private static ClickEvent.OpenUrl createOpenUrlClickEvent(String url) {
         return new ClickEvent.OpenUrl(URI.create(url));
     }
 
     private static LiteralArgumentBuilder<FabricClientCommandSource> buildRootCommand(String root) {
         RequiredArgumentBuilder<FabricClientCommandSource, Double> startPitch =
-            argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0))
+            withSuggestions(argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0)), CURRENT_PITCH_SUGGESTIONS)
                 .executes(context -> PANORAMA_CONTROLLER.startAt(
                     context.getSource().getClient(),
                     DEFAULT_PANORAMA_INTERVAL_SECONDS,
@@ -251,16 +573,16 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     (float)DoubleArgumentType.getDouble(context, "pitch")
                 ));
         RequiredArgumentBuilder<FabricClientCommandSource, Double> startYaw =
-            argument("yaw", DoubleArgumentType.doubleArg()).then(startPitch);
+            withSuggestions(argument("yaw", DoubleArgumentType.doubleArg()), CURRENT_YAW_SUGGESTIONS).then(startPitch);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> startZ =
-            argument("z", DoubleArgumentType.doubleArg()).then(startYaw);
+            withSuggestions(argument("z", DoubleArgumentType.doubleArg()), CURRENT_Z_SUGGESTIONS).then(startYaw);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> startY =
-            argument("y", DoubleArgumentType.doubleArg()).then(startZ);
+            withSuggestions(argument("y", DoubleArgumentType.doubleArg()), CURRENT_Y_SUGGESTIONS).then(startZ);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> startX =
-            argument("x", DoubleArgumentType.doubleArg()).then(startY);
+            withSuggestions(argument("x", DoubleArgumentType.doubleArg()), CURRENT_X_SUGGESTIONS).then(startY);
 
         RequiredArgumentBuilder<FabricClientCommandSource, Double> everyPitch =
-            argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0))
+            withSuggestions(argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0)), CURRENT_PITCH_SUGGESTIONS)
                 .executes(context -> PANORAMA_CONTROLLER.startAt(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "intervalSeconds"),
@@ -271,15 +593,15 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     (float)DoubleArgumentType.getDouble(context, "pitch")
                 ));
         RequiredArgumentBuilder<FabricClientCommandSource, Double> everyYaw =
-            argument("yaw", DoubleArgumentType.doubleArg()).then(everyPitch);
+            withSuggestions(argument("yaw", DoubleArgumentType.doubleArg()), CURRENT_YAW_SUGGESTIONS).then(everyPitch);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> everyZ =
-            argument("z", DoubleArgumentType.doubleArg()).then(everyYaw);
+            withSuggestions(argument("z", DoubleArgumentType.doubleArg()), CURRENT_Z_SUGGESTIONS).then(everyYaw);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> everyY =
-            argument("y", DoubleArgumentType.doubleArg()).then(everyZ);
+            withSuggestions(argument("y", DoubleArgumentType.doubleArg()), CURRENT_Y_SUGGESTIONS).then(everyZ);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> everyX =
-            argument("x", DoubleArgumentType.doubleArg()).then(everyY);
+            withSuggestions(argument("x", DoubleArgumentType.doubleArg()), CURRENT_X_SUGGESTIONS).then(everyY);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> everyInterval =
-            argument("intervalSeconds", DoubleArgumentType.doubleArg(0.1))
+            withSuggestions(argument("intervalSeconds", DoubleArgumentType.doubleArg(0.1)), INTERVAL_SUGGESTIONS)
                 .executes(context -> PANORAMA_CONTROLLER.startAtPlayer(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "intervalSeconds")
@@ -292,21 +614,21 @@ public final class SpectatorCamClient implements ClientModInitializer {
         LiteralArgumentBuilder<FabricClientCommandSource> panoramaDownscale = literal("downscale")
             .executes(context -> PANORAMA_CONTROLLER.downscaleStatus(context.getSource().getClient()))
             .then(literal("off").executes(context -> PANORAMA_CONTROLLER.disableDownscale(context.getSource().getClient())))
-            .then(argument("factor", DoubleArgumentType.doubleArg(1.0, 64.0))
+            .then(withSuggestions(argument("factor", DoubleArgumentType.doubleArg(1.0, 64.0)), DOWNSCALE_FACTOR_SUGGESTIONS)
                 .executes(context -> PANORAMA_CONTROLLER.setDownscale(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "factor"),
                     null,
                     null
                 ))
-                .then(argument("stage", StringArgumentType.word())
+                .then(withSuggestions(argument("stage", StringArgumentType.word()), PANORAMA_STAGE_SUGGESTIONS)
                     .executes(context -> PANORAMA_CONTROLLER.setDownscale(
                         context.getSource().getClient(),
                         DoubleArgumentType.getDouble(context, "factor"),
                         StringArgumentType.getString(context, "stage"),
                         null
                     ))
-                    .then(argument("interpolation", StringArgumentType.word())
+                    .then(withSuggestions(argument("interpolation", StringArgumentType.word()), DOWNSCALE_INTERPOLATION_SUGGESTIONS)
                         .executes(context -> PANORAMA_CONTROLLER.setDownscale(
                             context.getSource().getClient(),
                             DoubleArgumentType.getDouble(context, "factor"),
@@ -317,7 +639,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         LiteralArgumentBuilder<FabricClientCommandSource> panoramaNudge = literal("nudge")
             .executes(context -> PANORAMA_CONTROLLER.captureNudgeStatus(context.getSource().getClient()))
             .then(literal("off").executes(context -> PANORAMA_CONTROLLER.disableCaptureNudge(context.getSource().getClient())))
-            .then(argument("distance", DoubleArgumentType.doubleArg(-10.0, 10.0))
+            .then(withSuggestions(argument("distance", DoubleArgumentType.doubleArg(-10.0, 10.0)), NUDGE_SUGGESTIONS)
                 .executes(context -> PANORAMA_CONTROLLER.setCaptureNudge(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "distance")
@@ -325,14 +647,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         LiteralArgumentBuilder<FabricClientCommandSource> panoramaResolutionCommand = literal("resolution")
             .executes(context -> PANORAMA_CONTROLLER.resolutionStatus(context.getSource().getClient()))
-            .then(argument("size", IntegerArgumentType.integer(16, 8192))
+            .then(withSuggestions(argument("size", IntegerArgumentType.integer(16, 8192)), PANORAMA_RESOLUTION_SUGGESTIONS)
                 .executes(context -> PANORAMA_CONTROLLER.setResolution(
                     context.getSource().getClient(),
                     IntegerArgumentType.getInteger(context, "size")
                 )));
 
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singlePitch =
-            argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0))
+            withSuggestions(argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0)), CURRENT_PITCH_SUGGESTIONS)
                 .executes(context -> SINGLE_CONTROLLER.startAt(
                     context.getSource().getClient(),
                     DEFAULT_SINGLE_INTERVAL_SECONDS,
@@ -343,16 +665,16 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     (float)DoubleArgumentType.getDouble(context, "pitch")
                 ));
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleYaw =
-            argument("yaw", DoubleArgumentType.doubleArg()).then(singlePitch);
+            withSuggestions(argument("yaw", DoubleArgumentType.doubleArg()), CURRENT_YAW_SUGGESTIONS).then(singlePitch);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleZ =
-            argument("z", DoubleArgumentType.doubleArg()).then(singleYaw);
+            withSuggestions(argument("z", DoubleArgumentType.doubleArg()), CURRENT_Z_SUGGESTIONS).then(singleYaw);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleY =
-            argument("y", DoubleArgumentType.doubleArg()).then(singleZ);
+            withSuggestions(argument("y", DoubleArgumentType.doubleArg()), CURRENT_Y_SUGGESTIONS).then(singleZ);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleX =
-            argument("x", DoubleArgumentType.doubleArg()).then(singleY);
+            withSuggestions(argument("x", DoubleArgumentType.doubleArg()), CURRENT_X_SUGGESTIONS).then(singleY);
 
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleEveryPitch =
-            argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0))
+            withSuggestions(argument("pitch", DoubleArgumentType.doubleArg(-90.0, 90.0)), CURRENT_PITCH_SUGGESTIONS)
                 .executes(context -> SINGLE_CONTROLLER.startAt(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "intervalSeconds"),
@@ -363,15 +685,15 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     (float)DoubleArgumentType.getDouble(context, "pitch")
                 ));
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleEveryYaw =
-            argument("yaw", DoubleArgumentType.doubleArg()).then(singleEveryPitch);
+            withSuggestions(argument("yaw", DoubleArgumentType.doubleArg()), CURRENT_YAW_SUGGESTIONS).then(singleEveryPitch);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleEveryZ =
-            argument("z", DoubleArgumentType.doubleArg()).then(singleEveryYaw);
+            withSuggestions(argument("z", DoubleArgumentType.doubleArg()), CURRENT_Z_SUGGESTIONS).then(singleEveryYaw);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleEveryY =
-            argument("y", DoubleArgumentType.doubleArg()).then(singleEveryZ);
+            withSuggestions(argument("y", DoubleArgumentType.doubleArg()), CURRENT_Y_SUGGESTIONS).then(singleEveryZ);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleEveryX =
-            argument("x", DoubleArgumentType.doubleArg()).then(singleEveryY);
+            withSuggestions(argument("x", DoubleArgumentType.doubleArg()), CURRENT_X_SUGGESTIONS).then(singleEveryY);
         RequiredArgumentBuilder<FabricClientCommandSource, Double> singleEveryInterval =
-            argument("intervalSeconds", DoubleArgumentType.doubleArg(0.1))
+            withSuggestions(argument("intervalSeconds", DoubleArgumentType.doubleArg(0.1)), INTERVAL_SUGGESTIONS)
                 .executes(context -> SINGLE_CONTROLLER.startAtPlayer(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "intervalSeconds")
@@ -380,8 +702,8 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         LiteralArgumentBuilder<FabricClientCommandSource> singleResolutionCommand = literal("resolution")
             .executes(context -> SINGLE_CONTROLLER.resolutionStatus(context.getSource().getClient()))
-            .then(argument("width", IntegerArgumentType.integer(64, 4096))
-                .then(argument("height", IntegerArgumentType.integer(64, 4096))
+            .then(withSuggestions(argument("width", IntegerArgumentType.integer(64, 4096)), SINGLE_RESOLUTION_SUGGESTIONS)
+                .then(withSuggestions(argument("height", IntegerArgumentType.integer(64, 4096)), SINGLE_RESOLUTION_SUGGESTIONS)
                     .executes(context -> SINGLE_CONTROLLER.setResolution(
                         context.getSource().getClient(),
                         IntegerArgumentType.getInteger(context, "width"),
@@ -390,7 +712,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         LiteralArgumentBuilder<FabricClientCommandSource> singleFovCommand = literal("fov")
             .executes(context -> SINGLE_CONTROLLER.fovStatus(context.getSource().getClient()))
-            .then(argument("degrees", DoubleArgumentType.doubleArg(1.0, 179.0))
+            .then(withSuggestions(argument("degrees", DoubleArgumentType.doubleArg(1.0, 179.0)), FOV_SUGGESTIONS)
                 .executes(context -> SINGLE_CONTROLLER.setFov(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "degrees")
@@ -400,6 +722,31 @@ public final class SpectatorCamClient implements ClientModInitializer {
             .executes(context -> SINGLE_CONTROLLER.renderPlayerStatus(context.getSource().getClient()))
             .then(literal("on").executes(context -> SINGLE_CONTROLLER.setRenderPlayerEnabled(context.getSource().getClient(), true)))
             .then(literal("off").executes(context -> SINGLE_CONTROLLER.setRenderPlayerEnabled(context.getSource().getClient(), false)));
+
+        LiteralArgumentBuilder<FabricClientCommandSource> singleDownscaleCommand = literal("downscale")
+            .executes(context -> SINGLE_CONTROLLER.downscaleStatus(context.getSource().getClient()))
+            .then(literal("off").executes(context -> SINGLE_CONTROLLER.disableDownscale(context.getSource().getClient())))
+            .then(withSuggestions(argument("factor", DoubleArgumentType.doubleArg(1.0, 64.0)), DOWNSCALE_FACTOR_SUGGESTIONS)
+                .executes(context -> SINGLE_CONTROLLER.setDownscale(
+                    context.getSource().getClient(),
+                    DoubleArgumentType.getDouble(context, "factor"),
+                    null,
+                    null
+                ))
+                .then(withSuggestions(argument("stage", StringArgumentType.word()), SINGLE_STAGE_SUGGESTIONS)
+                    .executes(context -> SINGLE_CONTROLLER.setDownscale(
+                        context.getSource().getClient(),
+                        DoubleArgumentType.getDouble(context, "factor"),
+                        StringArgumentType.getString(context, "stage"),
+                        null
+                    ))
+                    .then(withSuggestions(argument("interpolation", StringArgumentType.word()), DOWNSCALE_INTERPOLATION_SUGGESTIONS)
+                        .executes(context -> SINGLE_CONTROLLER.setDownscale(
+                            context.getSource().getClient(),
+                            DoubleArgumentType.getDouble(context, "factor"),
+                            StringArgumentType.getString(context, "stage"),
+                            StringArgumentType.getString(context, "interpolation")
+                        )))));
 
         LiteralArgumentBuilder<FabricClientCommandSource> singleCommand = literal("single")
             .executes(context -> SINGLE_CONTROLLER.startAtPlayer(
@@ -411,12 +758,12 @@ public final class SpectatorCamClient implements ClientModInitializer {
             .then(singleResolutionCommand)
             .then(singleFovCommand)
             .then(singleRenderPlayerCommand)
+            .then(singleDownscaleCommand)
             .then(literal("stop").executes(context -> SINGLE_CONTROLLER.stop(context.getSource().getClient(), true)))
             .then(literal("status").executes(context -> SINGLE_CONTROLLER.status(context.getSource().getClient())));
 
         return literal(root)
             .executes(context -> CAMERA_CONTROLLER.toggle(context.getSource().getClient()))
-            .then(literal("where").executes(context -> CAMERA_CONTROLLER.printPosition(context.getSource().getClient())))
             .then(singleCommand)
             .then(literal("panorama")
                 .executes(context -> PANORAMA_CONTROLLER.startAtPlayer(
@@ -441,23 +788,17 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     .then(literal("off").executes(context -> PANORAMA_CONTROLLER.setExportEnabled(context.getSource().getClient(), false))))
                 .then(panoramaDownscale)
                 .then(panoramaResolutionCommand)
-                .then(panoramaNudge))
-            .then(literal("tp")
-                .then(argument("x", DoubleArgumentType.doubleArg())
-                    .then(argument("y", DoubleArgumentType.doubleArg())
-                        .then(argument("z", DoubleArgumentType.doubleArg())
-                            .executes(context -> CAMERA_CONTROLLER.teleport(
-                                context.getSource().getClient(),
-                                        DoubleArgumentType.getDouble(context, "x"),
-                                        DoubleArgumentType.getDouble(context, "y"),
-                                DoubleArgumentType.getDouble(context, "z")
-                            ))))));
+                .then(panoramaNudge));
     }
 
     private static final class SpectatorCameraController {
         private boolean enabled;
         private OtherClientPlayerEntity cameraEntity;
         private ClientWorld cameraWorld;
+
+        private boolean isCameraEntity(Entity entity) {
+            return entity == cameraEntity;
+        }
 
         private void tick(MinecraftClient client) {
             if (!enabled) {
@@ -472,6 +813,8 @@ public final class SpectatorCamClient implements ClientModInitializer {
             if (cameraEntity == null || cameraWorld != client.world) {
                 createOrResetCamera(client.world, client.player);
             }
+
+            keepCameraStanding();
 
             if (client.getCameraEntity() != cameraEntity) {
                 client.setCameraEntity(cameraEntity);
@@ -491,7 +834,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             createOrResetCamera(client.world, client.player);
             enabled = true;
             client.setCameraEntity(cameraEntity);
-            send(client, "Enabled. Teleport with /panshot tp <x> <y> <z>.");
+            send(client, "Enabled.");
             return 1;
         }
 
@@ -566,7 +909,13 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             cameraEntity.noClip = true;
             cameraEntity.setNoGravity(true);
+            keepCameraStanding();
             teleportInternal(player.getX(), player.getY(), player.getZ(), player.getYaw(), player.getPitch());
+        }
+
+        private void keepCameraStanding() {
+            cameraEntity.setSneaking(false);
+            cameraEntity.setPose(EntityPose.STANDING);
         }
 
         private void teleportInternal(double x, double y, double z, float yaw, float pitch) {
@@ -591,7 +940,6 @@ public final class SpectatorCamClient implements ClientModInitializer {
             5, 0, 2
         };
         private static final String CUBEMAP_FILE_NAME = "panorama_cubemap.png";
-        private static final double MIN_DOWNSCALE_FACTOR = 1.0;
         private static final double NUDGE_EPSILON = 1.0E-6;
 
         private enum DownscaleStage {
@@ -609,32 +957,6 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 return switch (normalized) {
                     case "faces", "face", "pre", "before", "before_stitch", "prestitch" -> FACES;
                     case "cubemap", "cube", "post", "after", "after_stitch", "poststitch" -> CUBEMAP;
-                    default -> null;
-                };
-            }
-        }
-
-        private enum DownscaleInterpolation {
-            NEAREST("nearest"),
-            BILINEAR("bilinear"),
-            BICUBIC("bicubic"),
-            BOX("box"),
-            SUPERSAMPLE("supersample");
-
-            private final String label;
-
-            DownscaleInterpolation(String label) {
-                this.label = label;
-            }
-
-            private static DownscaleInterpolation parse(String token) {
-                String normalized = token.toLowerCase(Locale.ROOT);
-                return switch (normalized) {
-                    case "nearest", "nearest_neighbor", "nearest-neighbor" -> NEAREST;
-                    case "linear", "bilinear" -> BILINEAR;
-                    case "cubic", "bicubic" -> BICUBIC;
-                    case "box", "area", "boxscale", "box_scaling", "box-scaling" -> BOX;
-                    case "supersample", "supersampling", "super", "ssaa" -> SUPERSAMPLE;
                     default -> null;
                 };
             }
@@ -681,10 +1003,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private long lastSkippedStitchMessageTick = Long.MIN_VALUE;
 
         private void tick(MinecraftClient client) {
-            tickCounter++;
             if (!running) {
                 return;
             }
+            tickCounter++;
 
             if (client.player == null || client.world == null) {
                 stopInternal(client, false, "Panorama capture stopped because no world is loaded.");
@@ -730,7 +1052,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 return 0;
             }
 
-            Vec3d eyePos = client.player.getEyePos();
+            Vec3d eyePos = getStandingPlayerEyePos(client.player);
             return startAt(client, intervalSeconds, eyePos.x, eyePos.y, eyePos.z, client.player.getYaw(), 0.0f);
         }
 
@@ -1318,171 +1640,6 @@ public final class SpectatorCamClient implements ClientModInitializer {
             }
         }
 
-        private static int scaledDimension(int sourceDimension, double factor) {
-            if (factor <= MIN_DOWNSCALE_FACTOR) {
-                return sourceDimension;
-            }
-            int scaled = (int)Math.round(sourceDimension / factor);
-            return Math.max(1, Math.min(sourceDimension, scaled));
-        }
-
-        private static BufferedImage resizeBufferedImage(
-            BufferedImage source,
-            int targetWidth,
-            int targetHeight,
-            DownscaleInterpolation interpolation
-        ) {
-            if (source.getWidth() == targetWidth && source.getHeight() == targetHeight) {
-                return source;
-            }
-
-            return switch (interpolation) {
-                case NEAREST -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-                case BILINEAR -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-                case BICUBIC -> drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-                case BOX -> resizeBoxAveraging(source, targetWidth, targetHeight);
-                case SUPERSAMPLE -> resizeSupersample(source, targetWidth, targetHeight);
-            };
-        }
-
-        private static BufferedImage drawResizedImage(BufferedImage source, int targetWidth, int targetHeight, Object interpolationHint) {
-            BufferedImage output = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB);
-            Graphics2D graphics = output.createGraphics();
-            try {
-                graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, interpolationHint);
-                graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
-                graphics.setRenderingHint(RenderingHints.KEY_ALPHA_INTERPOLATION, RenderingHints.VALUE_ALPHA_INTERPOLATION_QUALITY);
-                graphics.drawImage(source, 0, 0, targetWidth, targetHeight, null);
-            } finally {
-                graphics.dispose();
-            }
-            return output;
-        }
-
-        private static BufferedImage resizeSupersample(BufferedImage source, int targetWidth, int targetHeight) {
-            if (targetWidth >= source.getWidth() || targetHeight >= source.getHeight()) {
-                return drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-            }
-
-            BufferedImage current = source;
-            boolean currentOwned = false;
-            while (current.getWidth() / 2 >= targetWidth && current.getHeight() / 2 >= targetHeight) {
-                int nextWidth = Math.max(targetWidth, current.getWidth() / 2);
-                int nextHeight = Math.max(targetHeight, current.getHeight() / 2);
-                BufferedImage next = drawResizedImage(current, nextWidth, nextHeight, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-                if (currentOwned) {
-                    current.flush();
-                }
-                current = next;
-                currentOwned = true;
-            }
-
-            if (current.getWidth() != targetWidth || current.getHeight() != targetHeight) {
-                BufferedImage next = drawResizedImage(current, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-                if (currentOwned) {
-                    current.flush();
-                }
-                current = next;
-            }
-
-            return current;
-        }
-
-        private static BufferedImage resizeBoxAveraging(BufferedImage source, int targetWidth, int targetHeight) {
-            if (targetWidth >= source.getWidth() || targetHeight >= source.getHeight()) {
-                return drawResizedImage(source, targetWidth, targetHeight, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-            }
-
-            int sourceWidth = source.getWidth();
-            int sourceHeight = source.getHeight();
-            int[] sourcePixels = source.getRGB(0, 0, sourceWidth, sourceHeight, null, 0, sourceWidth);
-            int[] outputPixels = new int[targetWidth * targetHeight];
-
-            double scaleX = (double)sourceWidth / targetWidth;
-            double scaleY = (double)sourceHeight / targetHeight;
-
-            for (int y = 0; y < targetHeight; y++) {
-                double srcY0 = y * scaleY;
-                double srcY1 = srcY0 + scaleY;
-                int minY = (int)Math.floor(srcY0);
-                int maxY = (int)Math.ceil(srcY1);
-                int outputRow = y * targetWidth;
-
-                for (int x = 0; x < targetWidth; x++) {
-                    double srcX0 = x * scaleX;
-                    double srcX1 = srcX0 + scaleX;
-                    int minX = (int)Math.floor(srcX0);
-                    int maxX = (int)Math.ceil(srcX1);
-
-                    double weightSum = 0.0;
-                    double alphaSum = 0.0;
-                    double redSum = 0.0;
-                    double greenSum = 0.0;
-                    double blueSum = 0.0;
-
-                    for (int srcY = minY; srcY < maxY; srcY++) {
-                        if (srcY < 0 || srcY >= sourceHeight) {
-                            continue;
-                        }
-                        double yCoverage = pixelCoverage(srcY, srcY0, srcY1);
-                        if (yCoverage <= 0.0) {
-                            continue;
-                        }
-
-                        int sourceRow = srcY * sourceWidth;
-                        for (int srcX = minX; srcX < maxX; srcX++) {
-                            if (srcX < 0 || srcX >= sourceWidth) {
-                                continue;
-                            }
-                            double xCoverage = pixelCoverage(srcX, srcX0, srcX1);
-                            double weight = xCoverage * yCoverage;
-                            if (weight <= 0.0) {
-                                continue;
-                            }
-
-                            int argb = sourcePixels[sourceRow + srcX];
-                            int alpha = (argb >>> 24) & 0xFF;
-                            int red = (argb >>> 16) & 0xFF;
-                            int green = (argb >>> 8) & 0xFF;
-                            int blue = argb & 0xFF;
-
-                            weightSum += weight;
-                            alphaSum += alpha * weight;
-                            redSum += red * weight;
-                            greenSum += green * weight;
-                            blueSum += blue * weight;
-                        }
-                    }
-
-                    if (weightSum <= 0.0) {
-                        outputPixels[outputRow + x] = 0xFF000000;
-                        continue;
-                    }
-
-                    int alpha = (int)Math.round(alphaSum / weightSum);
-                    int red = (int)Math.round(redSum / weightSum);
-                    int green = (int)Math.round(greenSum / weightSum);
-                    int blue = (int)Math.round(blueSum / weightSum);
-
-                    outputPixels[outputRow + x] =
-                        ((alpha & 0xFF) << 24)
-                            | ((red & 0xFF) << 16)
-                            | ((green & 0xFF) << 8)
-                            | (blue & 0xFF);
-                }
-            }
-
-            BufferedImage output = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB);
-            output.setRGB(0, 0, targetWidth, targetHeight, outputPixels, 0, targetWidth);
-            return output;
-        }
-
-        private static double pixelCoverage(int pixelIndex, double min, double max) {
-            double pixelMin = pixelIndex;
-            double pixelMax = pixelIndex + 1.0;
-            return Math.max(0.0, Math.min(pixelMax, max) - Math.max(pixelMin, min));
-        }
-
         private NativeImage[] detachCapturedFaces() {
             for (int i = 0; i < capturedFaces.length; i++) {
                 if (capturedFaces[i] == null) {
@@ -1646,6 +1803,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
             }
         }
 
+        private boolean isCameraEntity(Entity entity) {
+            return entity == panoramaEntity;
+        }
+
         private void clearCapturedFaces() {
             for (int i = 0; i < capturedFaces.length; i++) {
                 if (capturedFaces[i] != null) {
@@ -1710,6 +1871,8 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private int captureWidth = DEFAULT_SINGLE_WIDTH;
         private int captureHeight = DEFAULT_SINGLE_HEIGHT;
         private double captureFov = DEFAULT_SINGLE_FOV;
+        private volatile double downscaleFactor = MIN_DOWNSCALE_FACTOR;
+        private volatile DownscaleInterpolation downscaleInterpolation = DownscaleInterpolation.BICUBIC;
         private volatile boolean renderPlayerEnabled;
         private volatile byte[] latestImageBytes;
         private volatile long latestImageTimestamp;
@@ -1722,10 +1885,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private long lastSkippedEncodeMessageTick = Long.MIN_VALUE;
 
         private void tick(MinecraftClient client) {
-            tickCounter++;
             if (!running) {
                 return;
             }
+            tickCounter++;
 
             if (client.player == null || client.world == null) {
                 stopInternal(client, false, "Single preview stopped because no world is loaded.");
@@ -1757,7 +1920,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 return 0;
             }
 
-            Vec3d eyePos = client.player.getEyePos();
+            Vec3d eyePos = getStandingPlayerEyePos(client.player);
             return startAt(client, intervalSeconds, eyePos.x, eyePos.y, eyePos.z, client.player.getYaw(), client.player.getPitch());
         }
 
@@ -1789,7 +1952,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             send(client, String.format(
                 Locale.ROOT,
-                "Single preview started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, %dx%d, fov %s, renderplayer %s).",
+                "Single preview started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, %dx%d, fov %s, downscale %s, renderplayer %s).",
                 x,
                 y,
                 z,
@@ -1799,6 +1962,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 captureWidth,
                 captureHeight,
                 formatFov(captureFov),
+                describeDownscale(),
                 renderPlayerEnabled ? "on" : "off"
             ));
             return 1;
@@ -1825,7 +1989,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             double seconds = Math.max(0.0, (nextCaptureTick - tickCounter) / 20.0);
             send(client, String.format(
                 Locale.ROOT,
-                "Running: next frame in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, frames %d, %dx%d, fov %s, renderplayer %s).",
+                "Running: next frame in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, frames %d, %dx%d, fov %s, downscale %s, renderplayer %s).",
                 seconds,
                 origin.x,
                 origin.y,
@@ -1836,6 +2000,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 captureWidth,
                 captureHeight,
                 formatFov(captureFov),
+                describeDownscale(),
                 renderPlayerEnabled ? "on" : "off"
             ));
             return 1;
@@ -1872,6 +2037,57 @@ public final class SpectatorCamClient implements ClientModInitializer {
             captureFov = clampFov(fov);
             send(client, String.format(Locale.ROOT, "Single preview FOV set to %s.", formatFov(captureFov)));
             return 1;
+        }
+
+        private int downscaleStatus(MinecraftClient client) {
+            send(client, "Single downscale is " + describeDownscale() + ".");
+            return 1;
+        }
+
+        private int disableDownscale(MinecraftClient client) {
+            downscaleFactor = MIN_DOWNSCALE_FACTOR;
+            send(client, "Single downscale disabled.");
+            return 1;
+        }
+
+        private int setDownscale(MinecraftClient client, double factor, String stageToken, String interpolationToken) {
+            DownscaleInterpolation resolvedInterpolation = downscaleInterpolation;
+            if (stageToken != null && SingleDownscaleStage.parse(stageToken) == null) {
+                DownscaleInterpolation interpolationAlias = interpolationToken == null ? DownscaleInterpolation.parse(stageToken) : null;
+                if (interpolationAlias != null) {
+                    resolvedInterpolation = interpolationAlias;
+                } else {
+                    send(client, "Unknown downscale stage '" + stageToken + "'. Use: image, faces, or cubemap.");
+                    return 0;
+                }
+            }
+
+            if (interpolationToken != null) {
+                resolvedInterpolation = DownscaleInterpolation.parse(interpolationToken);
+                if (resolvedInterpolation == null) {
+                    send(client, "Unknown interpolation '" + interpolationToken + "'. Use: nearest, bilinear, bicubic, cubic, box, supersample.");
+                    return 0;
+                }
+            }
+
+            downscaleFactor = Math.max(MIN_DOWNSCALE_FACTOR, factor);
+            downscaleInterpolation = resolvedInterpolation;
+            send(client, "Single downscale set to " + describeDownscale() + ".");
+            return 1;
+        }
+
+        private String describeDownscale() {
+            double factor = downscaleFactor;
+            if (factor <= MIN_DOWNSCALE_FACTOR) {
+                return "off";
+            }
+
+            return String.format(
+                Locale.ROOT,
+                "%.2fx (%s)",
+                factor,
+                downscaleInterpolation.label
+            );
         }
 
         private int renderPlayerStatus(MinecraftClient client) {
@@ -1929,7 +2145,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             client.setCameraEntity(singleEntity);
             client.options.setPerspective(Perspective.FIRST_PERSON);
             client.options.getFov().setValue(targetBaseFov);
-            client.options.hudHidden = true;
+            client.options.hudHidden = !renderPlayerEnabled;
             gameRendererAccessor.spectatorcam$setRenderBlockOutline(false);
             gameRendererAccessor.spectatorcam$setFovScale(targetFovScale);
             gameRendererAccessor.spectatorcam$setOldFovScale(targetFovScale);
@@ -2089,7 +2305,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             encodeExecutor.execute(() -> {
                 try (NativeImage capturedImage = image) {
-                    latestImageBytes = encodePngBytes(capturedImage);
+                    latestImageBytes = encodeSingleFrameBytes(capturedImage);
                     latestImageTimestamp = System.currentTimeMillis();
                 } catch (Exception exception) {
                     client.execute(() -> send(client, "Single preview encode failed: " + exception.getMessage()));
@@ -2097,6 +2313,25 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     encodeInFlight.set(false);
                 }
             });
+        }
+
+        private byte[] encodeSingleFrameBytes(NativeImage image) throws IOException {
+            BufferedImage source = toBufferedImage(image);
+            BufferedImage output = source;
+            try {
+                double factor = downscaleFactor;
+                if (factor > MIN_DOWNSCALE_FACTOR) {
+                    int targetWidth = scaledDimension(source.getWidth(), factor);
+                    int targetHeight = scaledDimension(source.getHeight(), factor);
+                    output = resizeBufferedImage(source, targetWidth, targetHeight, downscaleInterpolation);
+                }
+                return encodePngBytes(output);
+            } finally {
+                if (output != source) {
+                    output.flush();
+                }
+                source.flush();
+            }
         }
 
         private float clampPitch(float value) {
@@ -2218,6 +2453,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     .withClickEvent(createOpenUrlClickEvent(url)));
                 client.player.sendMessage(Text.literal(MESSAGE_PREFIX + "Single viewer: ").append(link), false);
             }
+        }
+
+        private boolean isCameraEntity(Entity entity) {
+            return entity == singleEntity;
         }
 
         @Override
