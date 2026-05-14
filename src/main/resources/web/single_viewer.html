@@ -125,10 +125,10 @@
 <canvas id="previewCanvas"></canvas>
 
 <div class="panel">
-  <h1 class="title">PanShot Single Compare</h1>
+  <h1 class="title">PanShot Single Reference</h1>
   <div class="row">
-    <button id="loadCompareButton" type="button">Load Compare</button>
-    <button id="clearCompareButton" type="button">Clear Compare</button>
+    <button id="loadCompareButton" type="button">Load Reference</button>
+    <button id="clearCompareButton" type="button">Clear Reference</button>
     <button id="resetViewButton" type="button">Reset View</button>
     <input id="fileInput" type="file" accept="image/*" hidden>
   </div>
@@ -138,10 +138,15 @@
     <span id="opacityValue" class="hint">50%</span>
   </div>
   <div class="row">
+    <label for="referenceEv">Brightness</label>
+    <input id="referenceEv" type="range" min="0" max="100" value="0">
+    <span id="referenceEvValue" class="hint">Off</span>
+  </div>
+  <div class="row">
     <label><input id="flipToggle" type="checkbox"> Flip A/B</label>
     <label><input id="autoFlipToggle" type="checkbox"> Auto flip</label>
     <label>Ms</label>
-    <input id="autoFlipInterval" type="number" min="100" step="50" value="500">
+    <input id="autoFlipInterval" type="number" min="100" step="50" value="1000">
     <span id="zoomValue" class="hint">Zoom: 1x</span>
   </div>
   <div id="status" class="status">Connecting to single preview stream...</div>
@@ -160,6 +165,8 @@
   const fileInput = document.getElementById("fileInput");
   const opacityInput = document.getElementById("opacity");
   const opacityValue = document.getElementById("opacityValue");
+  const referenceEvInput = document.getElementById("referenceEv");
+  const referenceEvValue = document.getElementById("referenceEvValue");
   const flipToggle = document.getElementById("flipToggle");
   const autoFlipToggle = document.getElementById("autoFlipToggle");
   const autoFlipIntervalInput = document.getElementById("autoFlipInterval");
@@ -167,10 +174,14 @@
   const statusEl = document.getElementById("status");
 
   let liveBitmap = null;
+  let loadedReferenceBitmap = null;
   let compareBitmap = null;
+  let adjustedCompareCanvas = null;
   let lastLiveTimestamp = 0;
   let liveRequestToken = 0;
   let lastState = null;
+  let referenceTransform = null;
+  let referenceTransformSignature = "";
   let autoFlipTimer = null;
   let pollStateTimer = null;
 
@@ -188,8 +199,25 @@
     return Math.max(min, Math.min(max, value));
   }
 
+  const SRGB_TO_LINEAR = (() => {
+    const table = new Float32Array(256);
+    for (let i = 0; i < table.length; i++) {
+      table[i] = Math.pow(i / 255, 2.2);
+    }
+    return table;
+  })();
+  const REFERENCE_MAX_EXPOSURE_STOPS = 10;
+
   function getCurrentOpacity() {
     return clamp(Number(opacityInput.value) / 100, 0, 1);
+  }
+
+  function getSliderAmount(input) {
+    return clamp(Number(input.value) / 100, 0, 1);
+  }
+
+  function getReferenceEvAmount() {
+    return getSliderAmount(referenceEvInput);
   }
 
   function getPrimaryBitmap() {
@@ -223,6 +251,13 @@
     opacityValue.textContent = opacityInput.value + "%";
   }
 
+  function updateReferenceEvLabel() {
+    const amount = getReferenceEvAmount();
+    referenceEvValue.textContent = amount > 0
+      ? Math.round(amount * 100) + "%"
+      : "Off";
+  }
+
   function updateZoomLabel() {
     zoomValue.textContent = "Zoom: " + zoom + "x";
   }
@@ -234,7 +269,13 @@
     }
 
     const liveSize = liveBitmap ? (liveBitmap.width + "x" + liveBitmap.height) : "none";
-    const compareSize = compareBitmap ? (compareBitmap.width + "x" + compareBitmap.height) : "none";
+    let compareSize = "none";
+    if (loadedReferenceBitmap) {
+      compareSize = loadedReferenceBitmap.width + "x" + loadedReferenceBitmap.height;
+      if (compareBitmap && (compareBitmap.width !== loadedReferenceBitmap.width || compareBitmap.height !== loadedReferenceBitmap.height)) {
+        compareSize += " -> " + compareBitmap.width + "x" + compareBitmap.height;
+      }
+    }
     if (!lastState) {
       statusEl.textContent = "Waiting for single preview state...";
       return;
@@ -248,7 +289,7 @@
       + lastState.lastModified
       + " | Live: "
       + liveSize
-      + " | Compare: "
+      + " | Reference: "
       + compareSize;
   }
 
@@ -258,6 +299,151 @@
     }
     redrawRequested = true;
     window.requestAnimationFrame(redraw);
+  }
+
+  function linearToSrgbUnit(value) {
+    return Math.pow(clamp(value, 0, 1), 1 / 2.2);
+  }
+
+  function finiteNumber(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function normalizeReferenceTransform(transform) {
+    if (!transform) {
+      return null;
+    }
+
+    const screenWidth = Math.round(finiteNumber(transform.screenWidth, 0));
+    const screenHeight = Math.round(finiteNumber(transform.screenHeight, 0));
+    const imageScale = finiteNumber(transform.imageScale, 1);
+    const imageScaleY = finiteNumber(transform.imageScaleY, 1);
+    if (screenWidth <= 0 || screenHeight <= 0 || imageScale <= 0 || imageScaleY <= 0) {
+      return null;
+    }
+
+    return {
+      screenWidth,
+      screenHeight,
+      imageScale,
+      imageScaleY,
+      frameCenterDx: finiteNumber(transform.frameCenterDx, 0),
+      frameCenterDy: finiteNumber(transform.frameCenterDy, 0)
+    };
+  }
+
+  function referenceTransformKey(transform) {
+    if (!transform) {
+      return "";
+    }
+    return [
+      transform.screenWidth,
+      transform.screenHeight,
+      transform.imageScale,
+      transform.imageScaleY,
+      transform.frameCenterDx,
+      transform.frameCenterDy
+    ].join("|");
+  }
+
+  function createReferenceDisplayImage(source) {
+    const transform = referenceTransform;
+    if (!transform) {
+      return source;
+    }
+
+    const drawWidth = source.width * transform.imageScale;
+    const drawHeight = source.height * transform.imageScale * transform.imageScaleY;
+    const drawX = (transform.screenWidth - drawWidth) * 0.5 + transform.frameCenterDx;
+    const drawY = (transform.screenHeight - drawHeight) * 0.5 + transform.frameCenterDy;
+    const unchanged = transform.screenWidth === source.width
+      && transform.screenHeight === source.height
+      && Math.abs(drawX) < 0.01
+      && Math.abs(drawY) < 0.01
+      && Math.abs(drawWidth - source.width) < 0.01
+      && Math.abs(drawHeight - source.height) < 0.01;
+    if (unchanged) {
+      return source;
+    }
+
+    const outputCanvas = document.createElement("canvas");
+    outputCanvas.width = transform.screenWidth;
+    outputCanvas.height = transform.screenHeight;
+    const outputContext = outputCanvas.getContext("2d", { willReadFrequently: true });
+    outputContext.imageSmoothingEnabled = false;
+    outputContext.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
+    outputContext.drawImage(source, drawX, drawY, drawWidth, drawHeight);
+    return outputCanvas;
+  }
+
+  function rebuildReferenceDisplayImage() {
+    const previousDisplay = compareBitmap;
+    compareBitmap = loadedReferenceBitmap ? createReferenceDisplayImage(loadedReferenceBitmap) : null;
+    if (previousDisplay && previousDisplay !== loadedReferenceBitmap && previousDisplay !== compareBitmap) {
+      closeBitmap(previousDisplay);
+    }
+    rebuildAdjustedCompareCanvas();
+    if (compareBitmap && (!centerInitialized || !liveBitmap)) {
+      centerX = compareBitmap.width * 0.5;
+      centerY = compareBitmap.height * 0.5;
+      centerInitialized = true;
+    }
+  }
+
+  function setReferenceTransform(transform) {
+    const normalized = normalizeReferenceTransform(transform);
+    const signature = referenceTransformKey(normalized);
+    if (signature === referenceTransformSignature) {
+      return;
+    }
+    referenceTransform = normalized;
+    referenceTransformSignature = signature;
+    rebuildReferenceDisplayImage();
+    updateStatusText(null);
+    requestRedraw();
+  }
+
+  function createAdjustedReferenceCanvas(source, evAmount) {
+    const outputCanvas = document.createElement("canvas");
+    outputCanvas.width = source.width;
+    outputCanvas.height = source.height;
+    const outputContext = outputCanvas.getContext("2d", { willReadFrequently: true });
+    outputContext.drawImage(source, 0, 0);
+
+    if (evAmount <= 0) {
+      return outputCanvas;
+    }
+
+    const imageData = outputContext.getImageData(0, 0, outputCanvas.width, outputCanvas.height);
+    const data = imageData.data;
+    const exposure = Math.pow(2, evAmount * REFERENCE_MAX_EXPOSURE_STOPS);
+
+    for (let i = 0; i < data.length; i += 4) {
+      let red = SRGB_TO_LINEAR[data[i]];
+      let green = SRGB_TO_LINEAR[data[i + 1]];
+      let blue = SRGB_TO_LINEAR[data[i + 2]];
+
+      data[i] = Math.round(linearToSrgbUnit(red * exposure) * 255);
+      data[i + 1] = Math.round(linearToSrgbUnit(green * exposure) * 255);
+      data[i + 2] = Math.round(linearToSrgbUnit(blue * exposure) * 255);
+    }
+
+    outputContext.putImageData(imageData, 0, 0);
+    return outputCanvas;
+  }
+
+  function rebuildAdjustedCompareCanvas() {
+    adjustedCompareCanvas = null;
+    const evAmount = getReferenceEvAmount();
+    if (!compareBitmap || evAmount <= 0) {
+      return;
+    }
+    adjustedCompareCanvas = createAdjustedReferenceCanvas(compareBitmap, evAmount);
+  }
+
+  function getCompareDisplayImage() {
+    return adjustedCompareCanvas || compareBitmap;
   }
 
   function drawBitmap(bitmap, alpha) {
@@ -277,7 +463,8 @@
     context.fillStyle = "#0b0e16";
     context.fillRect(0, 0, canvas.width, canvas.height);
 
-    const hasAnyImage = !!liveBitmap || !!compareBitmap;
+    const compareDisplayImage = getCompareDisplayImage();
+    const hasAnyImage = !!liveBitmap || !!compareDisplayImage;
     if (!hasAnyImage) {
       return;
     }
@@ -292,18 +479,18 @@
     context.translate(-centerX, -centerY);
 
     const opacity = getCurrentOpacity();
-    if (liveBitmap && compareBitmap) {
+    if (liveBitmap && compareDisplayImage) {
       if (flipToggle.checked) {
-        drawBitmap(compareBitmap, 1);
+        drawBitmap(compareDisplayImage, 1);
         drawBitmap(liveBitmap, opacity);
       } else {
         drawBitmap(liveBitmap, 1);
-        drawBitmap(compareBitmap, opacity);
+        drawBitmap(compareDisplayImage, opacity);
       }
     } else if (liveBitmap) {
       drawBitmap(liveBitmap, 1);
     } else {
-      drawBitmap(compareBitmap, 1);
+      drawBitmap(compareDisplayImage, 1);
     }
 
     context.globalAlpha = 1;
@@ -384,6 +571,7 @@
 
       const state = await response.json();
       lastState = state;
+      setReferenceTransform(state.referenceTransform);
       if (state.available && state.lastModified > 0 && state.lastModified !== lastLiveTimestamp) {
         lastLiveTimestamp = state.lastModified;
         await loadLiveImage(lastLiveTimestamp);
@@ -413,7 +601,7 @@
       return;
     }
 
-    const intervalMs = Math.max(100, Math.round(Number(autoFlipIntervalInput.value) || 500));
+    const intervalMs = Math.max(100, Math.round(Number(autoFlipIntervalInput.value) || 1000));
     autoFlipIntervalInput.value = intervalMs;
     autoFlipTimer = setInterval(() => {
       flipToggle.checked = !flipToggle.checked;
@@ -426,8 +614,13 @@
   });
 
   clearCompareButton.addEventListener("click", () => {
-    closeBitmap(compareBitmap);
+    closeBitmap(loadedReferenceBitmap);
+    if (compareBitmap && compareBitmap !== loadedReferenceBitmap) {
+      closeBitmap(compareBitmap);
+    }
+    loadedReferenceBitmap = null;
     compareBitmap = null;
+    adjustedCompareCanvas = null;
     updateStatusText(null);
     requestRedraw();
   });
@@ -440,8 +633,13 @@
 
     try {
       const bitmap = await createImageBitmap(file);
-      closeBitmap(compareBitmap);
-      compareBitmap = bitmap;
+      closeBitmap(loadedReferenceBitmap);
+      if (compareBitmap && compareBitmap !== loadedReferenceBitmap) {
+        closeBitmap(compareBitmap);
+      }
+      loadedReferenceBitmap = bitmap;
+      compareBitmap = createReferenceDisplayImage(loadedReferenceBitmap);
+      rebuildAdjustedCompareCanvas();
       if (!centerInitialized) {
         centerX = compareBitmap.width * 0.5;
         centerY = compareBitmap.height * 0.5;
@@ -450,7 +648,7 @@
       updateStatusText(null);
       requestRedraw();
     } catch (error) {
-      updateStatusText("Compare image error: " + error.message);
+      updateStatusText("Reference image error: " + error.message);
     } finally {
       fileInput.value = "";
     }
@@ -460,6 +658,14 @@
     updateOpacityLabel();
     requestRedraw();
   });
+
+  function handleReferenceEvInput() {
+    updateReferenceEvLabel();
+    rebuildAdjustedCompareCanvas();
+    requestRedraw();
+  }
+
+  referenceEvInput.addEventListener("input", handleReferenceEvInput);
 
   flipToggle.addEventListener("change", () => {
     requestRedraw();
@@ -526,6 +732,7 @@
   });
 
   updateOpacityLabel();
+  updateReferenceEvLabel();
   updateZoomLabel();
   updateStatusText(null);
   requestRedraw();

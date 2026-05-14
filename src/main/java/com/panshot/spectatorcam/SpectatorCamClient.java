@@ -14,6 +14,11 @@ import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
 import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
 import com.panshot.spectatorcam.mixin.GameRendererAccessor;
 import com.panshot.spectatorcam.mixin.MinecraftClientAccessor;
 import com.panshot.spectatorcam.mixin.WindowAccessor;
@@ -254,6 +259,94 @@ public final class SpectatorCamClient implements ClientModInitializer {
         X,
         Y,
         Z
+    }
+
+    private enum PerspectiveImportMode {
+        AUTO,
+        SINGLE,
+        PANORAMA
+    }
+
+    private record PerspectiveReverserState(
+        double cameraX,
+        double cameraY,
+        double cameraZ,
+        double cameraYaw,
+        double cameraPitch,
+        double cameraFov,
+        double cameraYawSpeed,
+        int screenWidth,
+        int screenHeight,
+        double imageScale,
+        double imageScaleY,
+        double frameCenterDx,
+        double frameCenterDy,
+        int frameCount,
+        boolean panoramaFrameNames,
+        double frameIntervalSeconds
+    ) {
+        private boolean looksLikePanorama() {
+            double size = Math.max(screenWidth, screenHeight);
+            boolean squareFrame = Math.abs(screenWidth - screenHeight) <= Math.max(2.0, size * 0.02);
+            boolean yawStepped = frameCount >= 2 && Math.abs(cameraYawSpeed) >= 1.0;
+            return panoramaFrameNames || (yawStepped && squareFrame && Math.abs(cameraFov - 90.0) <= 5.0);
+        }
+
+        private double singleIntervalSeconds() {
+            return frameIntervalSeconds > 0.0 ? frameIntervalSeconds : DEFAULT_SINGLE_INTERVAL_SECONDS;
+        }
+
+        private double panoramaIntervalSeconds() {
+            if (frameIntervalSeconds > 0.0) {
+                return frameIntervalSeconds * 6.0;
+            }
+            if (Math.abs(cameraYawSpeed) >= 1.0E-6) {
+                return 540.0 / Math.abs(cameraYawSpeed);
+            }
+            return DEFAULT_PANORAMA_INTERVAL_SECONDS;
+        }
+
+        private ReferenceTransform toReferenceTransform(int outputWidth, int outputHeight) {
+            if (outputWidth == screenWidth && outputHeight == screenHeight) {
+                return new ReferenceTransform(screenWidth, screenHeight, imageScale, imageScaleY, frameCenterDx, frameCenterDy);
+            }
+
+            double scaleX = outputWidth / (double)screenWidth;
+            double scaleY = outputHeight / (double)screenHeight;
+            return new ReferenceTransform(
+                outputWidth,
+                outputHeight,
+                imageScale * scaleX,
+                imageScaleY * scaleY / scaleX,
+                frameCenterDx * scaleX,
+                frameCenterDy * scaleY
+            );
+        }
+    }
+
+    private record ReferenceTransform(
+        int screenWidth,
+        int screenHeight,
+        double imageScale,
+        double imageScaleY,
+        double frameCenterDx,
+        double frameCenterDy
+    ) {
+        private String toJson() {
+            return "{\"screenWidth\":"
+                + screenWidth
+                + ",\"screenHeight\":"
+                + screenHeight
+                + ",\"imageScale\":"
+                + formatJsonDouble(imageScale)
+                + ",\"imageScaleY\":"
+                + formatJsonDouble(imageScaleY)
+                + ",\"frameCenterDx\":"
+                + formatJsonDouble(frameCenterDx)
+                + ",\"frameCenterDy\":"
+                + formatJsonDouble(frameCenterDy)
+                + "}";
+        }
     }
 
     private enum DownscaleInterpolation {
@@ -556,8 +649,183 @@ public final class SpectatorCamClient implements ClientModInitializer {
         return text.substring(0, end);
     }
 
+    private static String formatJsonDouble(double value) {
+        if (!Double.isFinite(value)) {
+            return "0";
+        }
+        return Double.toString(value);
+    }
+
     private static ClickEvent.OpenUrl createOpenUrlClickEvent(String url) {
         return new ClickEvent.OpenUrl(URI.create(url));
+    }
+
+    private static void send(MinecraftClient client, String message) {
+        if (client.player != null) {
+            client.player.sendMessage(Text.literal(MESSAGE_PREFIX + message), false);
+        }
+    }
+
+    private static int importPerspectiveClipboard(MinecraftClient client, PerspectiveImportMode mode) {
+        String clipboard;
+        try {
+            clipboard = client.keyboard.getClipboard();
+        } catch (RuntimeException exception) {
+            send(client, "Could not read clipboard: " + exception.getMessage());
+            return 0;
+        }
+
+        if (clipboard == null || clipboard.isBlank()) {
+            send(client, "Clipboard is empty. Copy a PerspectiveReverser JSON state first.");
+            return 0;
+        }
+
+        PerspectiveReverserState state;
+        try {
+            state = parsePerspectiveReverserState(clipboard);
+        } catch (IllegalArgumentException exception) {
+            send(client, "Clipboard does not contain a usable PerspectiveReverser state: " + exception.getMessage());
+            return 0;
+        }
+
+        PerspectiveImportMode resolvedMode = mode;
+        if (resolvedMode == PerspectiveImportMode.AUTO) {
+            resolvedMode = state.looksLikePanorama() ? PerspectiveImportMode.PANORAMA : PerspectiveImportMode.SINGLE;
+        }
+
+        if (resolvedMode == PerspectiveImportMode.PANORAMA) {
+            return PANORAMA_CONTROLLER.importPerspectiveState(client, state);
+        }
+        return SINGLE_CONTROLLER.importPerspectiveState(client, state);
+    }
+
+    private static PerspectiveReverserState parsePerspectiveReverserState(String text) {
+        JsonObject root;
+        try {
+            JsonElement element = JsonParser.parseString(text);
+            if (!element.isJsonObject()) {
+                throw new IllegalArgumentException("root value is not an object");
+            }
+            root = element.getAsJsonObject();
+        } catch (JsonParseException exception) {
+            throw new IllegalArgumentException("invalid JSON");
+        }
+
+        int screenWidth = requiredInt(root, "screenWidth");
+        int screenHeight = requiredInt(root, "screenHeight");
+        if (screenWidth <= 0 || screenHeight <= 0) {
+            throw new IllegalArgumentException("screenWidth and screenHeight must be positive");
+        }
+
+        JsonArray frames = optionalArray(root, "frames");
+        int frameCount = frames != null ? frames.size() : 0;
+        boolean panoramaFrameNames = false;
+        double frameIntervalSeconds = 0.0;
+        double previousTime = Double.NaN;
+        if (frames != null) {
+            for (JsonElement frameElement : frames) {
+                if (!frameElement.isJsonObject()) {
+                    continue;
+                }
+                JsonObject frame = frameElement.getAsJsonObject();
+                String name = optionalString(frame, "name", "");
+                if (name.toLowerCase(Locale.ROOT).contains("panorama")) {
+                    panoramaFrameNames = true;
+                }
+                double time = optionalDouble(frame, "time", Double.NaN);
+                if (Double.isFinite(time)) {
+                    if (Double.isFinite(previousTime) && frameIntervalSeconds <= 0.0) {
+                        double delta = time - previousTime;
+                        if (delta > 1.0E-6) {
+                            frameIntervalSeconds = delta;
+                        }
+                    }
+                    previousTime = time;
+                }
+            }
+        }
+
+        return new PerspectiveReverserState(
+            requiredDouble(root, "cameraX"),
+            requiredDouble(root, "cameraY"),
+            requiredDouble(root, "cameraZ"),
+            requiredDouble(root, "cameraYaw"),
+            requiredDouble(root, "cameraPitch"),
+            requiredDouble(root, "cameraFov"),
+            optionalDouble(root, "cameraYawSpeed", 0.0),
+            screenWidth,
+            screenHeight,
+            positiveOptionalDouble(root, "imageScale", 1.0),
+            positiveOptionalDouble(root, "imageScaleY", 1.0),
+            optionalDouble(root, "frameCenterDx", 0.0),
+            optionalDouble(root, "frameCenterDy", 0.0),
+            frameCount,
+            panoramaFrameNames,
+            frameIntervalSeconds
+        );
+    }
+
+    private static JsonArray optionalArray(JsonObject object, String name) {
+        JsonElement element = object.get(name);
+        return element != null && element.isJsonArray() ? element.getAsJsonArray() : null;
+    }
+
+    private static String optionalString(JsonObject object, String name, String fallback) {
+        JsonElement element = object.get(name);
+        if (element == null || element.isJsonNull()) {
+            return fallback;
+        }
+        try {
+            return element.getAsString();
+        } catch (RuntimeException exception) {
+            return fallback;
+        }
+    }
+
+    private static int requiredInt(JsonObject object, String name) {
+        double value = requiredDouble(object, name);
+        if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(name + " is outside integer range");
+        }
+        return (int)Math.round(value);
+    }
+
+    private static double requiredDouble(JsonObject object, String name) {
+        JsonElement element = object.get(name);
+        if (element == null || element.isJsonNull()) {
+            throw new IllegalArgumentException("missing " + name);
+        }
+        return finiteDouble(element, name);
+    }
+
+    private static double optionalDouble(JsonObject object, String name, double fallback) {
+        JsonElement element = object.get(name);
+        if (element == null || element.isJsonNull()) {
+            return fallback;
+        }
+        try {
+            return finiteDouble(element, name);
+        } catch (IllegalArgumentException exception) {
+            return fallback;
+        }
+    }
+
+    private static double positiveOptionalDouble(JsonObject object, String name, double fallback) {
+        double value = optionalDouble(object, name, fallback);
+        return value > 0.0 ? value : fallback;
+    }
+
+    private static double finiteDouble(JsonElement element, String name) {
+        double value;
+        try {
+            value = element.getAsDouble();
+        } catch (RuntimeException exception) {
+            throw new IllegalArgumentException(name + " is not a number");
+        }
+        if (!Double.isFinite(value)) {
+            throw new IllegalArgumentException(name + " is not finite");
+        }
+        return value;
     }
 
     private static LiteralArgumentBuilder<FabricClientCommandSource> buildRootCommand(String root) {
@@ -759,11 +1027,19 @@ public final class SpectatorCamClient implements ClientModInitializer {
             .then(singleFovCommand)
             .then(singleRenderPlayerCommand)
             .then(singleDownscaleCommand)
+            .then(literal("clipboard").executes(context -> importPerspectiveClipboard(
+                context.getSource().getClient(),
+                PerspectiveImportMode.SINGLE
+            )))
             .then(literal("stop").executes(context -> SINGLE_CONTROLLER.stop(context.getSource().getClient(), true)))
             .then(literal("status").executes(context -> SINGLE_CONTROLLER.status(context.getSource().getClient())));
 
         return literal(root)
             .executes(context -> CAMERA_CONTROLLER.toggle(context.getSource().getClient()))
+            .then(literal("clipboard").executes(context -> importPerspectiveClipboard(
+                context.getSource().getClient(),
+                PerspectiveImportMode.AUTO
+            )))
             .then(singleCommand)
             .then(literal("panorama")
                 .executes(context -> PANORAMA_CONTROLLER.startAtPlayer(
@@ -772,6 +1048,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 ))
                 .then(startX)
                 .then(panoramaEvery)
+                .then(literal("clipboard").executes(context -> importPerspectiveClipboard(
+                    context.getSource().getClient(),
+                    PerspectiveImportMode.PANORAMA
+                )))
                 .then(literal("stop").executes(context -> PANORAMA_CONTROLLER.stop(context.getSource().getClient(), true)))
                 .then(literal("status").executes(context -> PANORAMA_CONTROLLER.status(context.getSource().getClient())))
                 .then(literal("mode")
@@ -1106,6 +1386,34 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return 1;
         }
 
+        private int importPerspectiveState(MinecraftClient client, PerspectiveReverserState state) {
+            int importedResolution = clampResolution(Math.min(state.screenWidth(), state.screenHeight()));
+            panoramaResolution = importedResolution;
+            if (Math.abs(state.cameraYawSpeed()) >= 1.0E-6) {
+                preciseCaptureMode = false;
+            }
+
+            int result = startAt(
+                client,
+                Math.max(0.1, state.panoramaIntervalSeconds()),
+                state.cameraX(),
+                state.cameraY(),
+                state.cameraZ(),
+                (float)state.cameraYaw(),
+                (float)state.cameraPitch()
+            );
+            if (result > 0) {
+                send(client, String.format(
+                    Locale.ROOT,
+                    "Imported PerspectiveReverser panorama from clipboard (%dx%d faces, fov %.1f).",
+                    importedResolution,
+                    importedResolution,
+                    state.cameraFov()
+                ));
+            }
+            return result;
+        }
+
         private int stop(MinecraftClient client, boolean notify) {
             if (!running) {
                 if (notify) {
@@ -1256,7 +1564,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         }
 
         private int setResolution(MinecraftClient client, int size) {
-            panoramaResolution = size;
+            panoramaResolution = clampResolution(size);
             if (running) {
                 send(client, "Panorama resolution set to " + describeConfiguredResolution() + " (applies next cycle).");
             } else {
@@ -1332,6 +1640,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         private String describeActiveResolution() {
             return cyclePanoramaResolution + "x" + cyclePanoramaResolution;
+        }
+
+        private int clampResolution(int size) {
+            return Math.max(16, Math.min(8192, size));
         }
 
         private RenderContext beginPanoramaRender(MinecraftClient client) {
@@ -1871,6 +2183,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private int captureWidth = DEFAULT_SINGLE_WIDTH;
         private int captureHeight = DEFAULT_SINGLE_HEIGHT;
         private double captureFov = DEFAULT_SINGLE_FOV;
+        private volatile ReferenceTransform referenceTransform;
         private volatile double downscaleFactor = MIN_DOWNSCALE_FACTOR;
         private volatile DownscaleInterpolation downscaleInterpolation = DownscaleInterpolation.BICUBIC;
         private volatile boolean renderPlayerEnabled;
@@ -1925,6 +2238,19 @@ public final class SpectatorCamClient implements ClientModInitializer {
         }
 
         private int startAt(MinecraftClient client, double intervalSeconds, double x, double y, double z, float yaw, float pitch) {
+            return startAt(client, intervalSeconds, x, y, z, yaw, pitch, null);
+        }
+
+        private int startAt(
+            MinecraftClient client,
+            double intervalSeconds,
+            double x,
+            double y,
+            double z,
+            float yaw,
+            float pitch,
+            ReferenceTransform importedReferenceTransform
+        ) {
             if (client.player == null || client.world == null) {
                 send(client, "Join a world first.");
                 return 0;
@@ -1934,6 +2260,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             origin = new Vec3d(x, y, z);
             this.yaw = yaw;
             this.pitch = clampPitch(pitch);
+            referenceTransform = importedReferenceTransform;
             intervalTicks = Math.max(1L, Math.round(intervalSeconds * 20.0));
             captureSessionId++;
             running = true;
@@ -1966,6 +2293,36 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 renderPlayerEnabled ? "on" : "off"
             ));
             return 1;
+        }
+
+        private int importPerspectiveState(MinecraftClient client, PerspectiveReverserState state) {
+            captureWidth = clampDimension(state.screenWidth());
+            captureHeight = clampDimension(state.screenHeight());
+            captureFov = clampFov(state.cameraFov());
+            ReferenceTransform importedReferenceTransform = state.toReferenceTransform(captureWidth, captureHeight);
+
+            int result = startAt(
+                client,
+                Math.max(0.1, state.singleIntervalSeconds()),
+                state.cameraX(),
+                state.cameraY(),
+                state.cameraZ(),
+                (float)state.cameraYaw(),
+                (float)state.cameraPitch(),
+                importedReferenceTransform
+            );
+            if (result > 0) {
+                send(client, String.format(
+                    Locale.ROOT,
+                    "Imported PerspectiveReverser single setup from clipboard (%dx%d, fov %s, reference frame %dx%d).",
+                    captureWidth,
+                    captureHeight,
+                    formatFov(captureFov),
+                    importedReferenceTransform.screenWidth(),
+                    importedReferenceTransform.screenHeight()
+                ));
+            }
+            return result;
         }
 
         private int stop(MinecraftClient client, boolean notify) {
@@ -2019,6 +2376,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private int setResolution(MinecraftClient client, int width, int height) {
             captureWidth = clampDimension(width);
             captureHeight = clampDimension(height);
+            referenceTransform = null;
             send(client, String.format(
                 Locale.ROOT,
                 "Single preview resolution set to %dx%d.",
@@ -2472,6 +2830,12 @@ public final class SpectatorCamClient implements ClientModInitializer {
         @Override
         public long getLatestImageTimestamp() {
             return latestImageTimestamp;
+        }
+
+        @Override
+        public String getReferenceTransformJson() {
+            ReferenceTransform transform = referenceTransform;
+            return transform == null ? null : transform.toJson();
         }
     }
 }

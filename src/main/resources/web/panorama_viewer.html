@@ -164,9 +164,9 @@
 <canvas id="rawCanvas"></canvas>
 
 <div class="panel">
-  <h1 class="title">PanShot 360 Compare</h1>
+  <h1 class="title">PanShot 360 Reference</h1>
   <div class="row">
-    <button id="loadButton" type="button">Load Vanilla Cubemap</button>
+    <button id="loadButton" type="button">Load Reference Cubemap</button>
     <button id="resetView" type="button">Reset View</button>
     <input id="fileInput" type="file" accept="image/*" multiple hidden>
   </div>
@@ -176,10 +176,15 @@
     <span id="blendValue" class="hint">50%</span>
   </div>
   <div class="row">
+    <label for="referenceEv">Brightness</label>
+    <input id="referenceEv" type="range" min="0" max="100" value="0">
+    <span id="referenceEvValue" class="hint">Off</span>
+  </div>
+  <div class="row">
     <label><input id="flipToggle" type="checkbox"> Flip A/B</label>
     <label><input id="autoFlipToggle" type="checkbox"> Auto flip</label>
     <label>Ms</label>
-    <input id="autoFlipInterval" type="number" min="100" step="50" value="500">
+    <input id="autoFlipInterval" type="number" min="100" step="50" value="1000">
     <span id="viewValue" class="hint">FOV: 90</span>
   </div>
   <div class="row">
@@ -215,6 +220,8 @@
   const fileInput = document.getElementById("fileInput");
   const blendSlider = document.getElementById("blend");
   const blendValue = document.getElementById("blendValue");
+  const referenceEvInput = document.getElementById("referenceEv");
+  const referenceEvValue = document.getElementById("referenceEvValue");
   const flipToggle = document.getElementById("flipToggle");
   const autoFlipToggle = document.getElementById("autoFlipToggle");
   const autoFlipIntervalInput = document.getElementById("autoFlipInterval");
@@ -244,6 +251,7 @@
   let liveAtlasImage = null;
   let liveAtlasCanvas = null;
   let customAtlasCanvas = null;
+  let adjustedCustomAtlasCanvas = null;
   let customLoaded = false;
   let lastLiveTimestamp = 0;
   let liveRequestToken = 0;
@@ -258,6 +266,19 @@
   let rawLastY = 0;
   let nearestPatchInstalled = false;
   let autoFlipTimer = null;
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  const SRGB_TO_LINEAR = (() => {
+    const table = new Float32Array(256);
+    for (let i = 0; i < table.length; i++) {
+      table[i] = Math.pow(i / 255, 2.2);
+    }
+    return table;
+  })();
+  const REFERENCE_MAX_EXPOSURE_STOPS = 10;
 
   function installNearestTexturePatch() {
     if (nearestPatchInstalled) {
@@ -308,6 +329,21 @@
 
   function updateBlendLabel() {
     blendValue.textContent = blendSlider.value + "%";
+  }
+
+  function getSliderAmount(input) {
+    return clamp(Number(input.value) / 100, 0, 1);
+  }
+
+  function getReferenceEvAmount() {
+    return getSliderAmount(referenceEvInput);
+  }
+
+  function updateReferenceEvLabel() {
+    const amount = getReferenceEvAmount();
+    referenceEvValue.textContent = amount > 0
+      ? Math.round(amount * 100) + "%"
+      : "Off";
   }
 
   function updateLiveLayerVisibility() {
@@ -412,6 +448,52 @@
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     ctx.drawImage(image, 0, 0);
     return canvas;
+  }
+
+  function linearToSrgbUnit(value) {
+    return Math.pow(clamp(value, 0, 1), 1 / 2.2);
+  }
+
+  function createAdjustedReferenceCanvas(source, evAmount) {
+    const outputCanvas = document.createElement("canvas");
+    outputCanvas.width = source.width;
+    outputCanvas.height = source.height;
+    const outputContext = outputCanvas.getContext("2d", { willReadFrequently: true });
+    outputContext.drawImage(source, 0, 0);
+
+    if (evAmount <= 0) {
+      return outputCanvas;
+    }
+
+    const imageData = outputContext.getImageData(0, 0, outputCanvas.width, outputCanvas.height);
+    const data = imageData.data;
+    const exposure = Math.pow(2, evAmount * REFERENCE_MAX_EXPOSURE_STOPS);
+
+    for (let i = 0; i < data.length; i += 4) {
+      let red = SRGB_TO_LINEAR[data[i]];
+      let green = SRGB_TO_LINEAR[data[i + 1]];
+      let blue = SRGB_TO_LINEAR[data[i + 2]];
+
+      data[i] = Math.round(linearToSrgbUnit(red * exposure) * 255);
+      data[i + 1] = Math.round(linearToSrgbUnit(green * exposure) * 255);
+      data[i + 2] = Math.round(linearToSrgbUnit(blue * exposure) * 255);
+    }
+
+    outputContext.putImageData(imageData, 0, 0);
+    return outputCanvas;
+  }
+
+  function rebuildAdjustedCustomAtlasCanvas() {
+    adjustedCustomAtlasCanvas = null;
+    const evAmount = getReferenceEvAmount();
+    if (!customAtlasCanvas || evAmount <= 0) {
+      return;
+    }
+    adjustedCustomAtlasCanvas = createAdjustedReferenceCanvas(customAtlasCanvas, evAmount);
+  }
+
+  function getCustomDisplayAtlasCanvas() {
+    return adjustedCustomAtlasCanvas || customAtlasCanvas;
   }
 
   function parseFaceIndex(name) {
@@ -528,7 +610,7 @@
       return;
     }
 
-    const intervalMs = Math.max(100, Math.round(Number(autoFlipIntervalInput.value) || 500));
+    const intervalMs = Math.max(100, Math.round(Number(autoFlipIntervalInput.value) || 1000));
     autoFlipIntervalInput.value = intervalMs;
     autoFlipTimer = setInterval(() => {
       flipToggle.checked = !flipToggle.checked;
@@ -665,7 +747,8 @@
     rawCtx.fillRect(0, 0, rawCanvas.width, rawCanvas.height);
 
     const liveCanvas = getLiveAtlasCanvas();
-    const base = liveCanvas || customAtlasCanvas;
+    const customDisplayCanvas = getCustomDisplayAtlasCanvas();
+    const base = liveCanvas || customDisplayCanvas;
     if (!base) {
       return;
     }
@@ -675,13 +758,13 @@
     let upper = null;
     let upperAlpha = 0;
 
-    if (customLoaded && customAtlasCanvas && liveCanvas) {
+    if (customLoaded && customDisplayCanvas && liveCanvas) {
       if (flipToggle.checked) {
-        lower = customAtlasCanvas;
+        lower = customDisplayCanvas;
         upper = liveCanvas;
       } else {
         lower = liveCanvas;
-        upper = customAtlasCanvas;
+        upper = customDisplayCanvas;
       }
       upperAlpha = blendAlpha;
     }
@@ -798,7 +881,8 @@
     try {
       customAtlasCanvas = await cubemapCanvasFromFiles(fileInput.files);
       customLoaded = true;
-      setViewerAtlas(customViewer, customAtlasCanvas, true);
+      rebuildAdjustedCustomAtlasCanvas();
+      setViewerAtlas(customViewer, getCustomDisplayAtlasCanvas(), true);
       syncCustomToLive();
       applyViewerBlend();
       drawRawAtlas();
@@ -814,6 +898,17 @@
     applyViewerBlend();
     drawRawAtlas();
   });
+
+  function handleReferenceEvInput() {
+    updateReferenceEvLabel();
+    rebuildAdjustedCustomAtlasCanvas();
+    setViewerAtlas(customViewer, getCustomDisplayAtlasCanvas(), true);
+    syncCustomToLive();
+    applyViewerBlend();
+    drawRawAtlas();
+  }
+
+  referenceEvInput.addEventListener("input", handleReferenceEvInput);
 
   flipToggle.addEventListener("change", () => {
     applyViewerBlend();
@@ -962,6 +1057,7 @@
   });
 
   updateBlendLabel();
+  updateReferenceEvLabel();
   initViewers();
   applyViewerBlend();
   applyModeVisibility();

@@ -68,8 +68,20 @@ public final class SinglePreviewWebServer {
         boolean available = imageBytes != null && imageBytes.length > 0;
         long lastModified = provider != null ? provider.getLatestImageTimestamp() : 0L;
         boolean running = provider != null && provider.isSingleRunning();
+        String referenceTransform = provider != null ? provider.getReferenceTransformJson() : null;
+        if (referenceTransform == null || referenceTransform.isBlank()) {
+            referenceTransform = "null";
+        }
 
-        String response = "{\"running\":" + running + ",\"available\":" + available + ",\"lastModified\":" + lastModified + "}";
+        String response = "{\"running\":"
+            + running
+            + ",\"available\":"
+            + available
+            + ",\"lastModified\":"
+            + lastModified
+            + ",\"referenceTransform\":"
+            + referenceTransform
+            + "}";
         byte[] payload = response.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
@@ -122,5 +134,7 @@ public final class SinglePreviewWebServer {
         byte[] getLatestImageBytes();
 
         long getLatestImageTimestamp();
+
+        String getReferenceTransformJson();
     }
 }
