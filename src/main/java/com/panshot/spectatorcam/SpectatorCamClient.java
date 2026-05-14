@@ -44,10 +44,16 @@ import net.minecraft.entity.player.SkinTextures;
 import net.minecraft.text.ClickEvent;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.Vec3d;
+import org.lwjgl.system.MemoryUtil;
 
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.awt.image.ColorModel;
+import java.awt.image.DataBuffer;
+import java.awt.image.DataBufferInt;
+import java.awt.image.Raster;
+import java.awt.image.WritableRaster;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.IntBuffer;
@@ -78,7 +84,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static final String[] DOWNSCALE_INTERPOLATION_SUGGESTIONS = {"nearest", "bilinear", "bicubic", "box", "supersample"};
     private static final String[] PANORAMA_RESOLUTION_SUGGESTIONS = {"512", "1024", "2048", "4096", "8192"};
     private static final String[] SINGLE_RESOLUTION_SUGGESTIONS = {"256", "512", "1024", "1920", "2048", "3840", "4096"};
-    private static final String[] FOV_SUGGESTIONS = {"30", "45", "60", "70", "90", "110", "120"};
+    private static final String[] FOV_SUGGESTIONS = {"0.5", "1", "30", "45", "60", "70", "90", "110", "150", "220"};
     private static final String[] NUDGE_SUGGESTIONS = {"-0.1", "-0.05", "0.05", "0.1", "0.25", "0.5"};
     private static final UUID CAMERA_PROFILE_ID = UUID.fromString("f0d6643c-af19-4e1e-948d-a5d2d7e2f27b");
     private static final PanoramaWebServer PANORAMA_WEB_SERVER = new PanoramaWebServer();
@@ -86,6 +92,9 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static final PanoramaCaptureController PANORAMA_CONTROLLER = new PanoramaCaptureController();
     private static final SingleCaptureController SINGLE_CONTROLLER = new SingleCaptureController();
     private static final SpectatorCameraController CAMERA_CONTROLLER = new SpectatorCameraController();
+    private static final int[] ARGB_BAND_MASKS = {0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000};
+    private static final ColorModel ARGB_COLOR_MODEL = ColorModel.getRGBdefault();
+    private static final int PNG_INITIAL_BUFFER_LIMIT = 64 * 1024 * 1024;
     private static final ExecutorService READBACK_CONVERT_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "panshot-readback-convert");
         thread.setDaemon(true);
@@ -133,6 +142,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
         int width = framebuffer.textureWidth;
         int height = framebuffer.textureHeight;
         int pixelSize = colorAttachment.getFormat().pixelSize();
+        if (pixelSize != Integer.BYTES) {
+            ScreenshotRecorder.takeScreenshot(framebuffer, consumer);
+            return;
+        }
         int pixelCount = width * height;
         int requiredBytes = pixelCount * pixelSize;
         GpuBuffer gpuBuffer = RenderSystem.getDevice().createBuffer(() -> "PanShot readback buffer", 9, requiredBytes);
@@ -150,19 +163,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 NativeImage image = null;
                 RuntimeException failure = null;
                 try {
-                    int[] readbackPixels = new int[pixelCount];
                     IntBuffer intBuffer = mappedView.data().asIntBuffer();
-                    intBuffer.get(readbackPixels, 0, pixelCount);
-
                     image = new NativeImage(width, height, false);
-                    for (int y = 0; y < height; y++) {
-                        int srcRow = y * width;
-                        int dstY = height - y - 1;
-                        for (int x = 0; x < width; x++) {
-                            image.setColor(x, dstY, readbackPixels[srcRow + x] | 0xFF000000);
-                        }
-                    }
+                    copyReadbackToNativeImage(intBuffer, image, width, height);
                 } catch (RuntimeException exception) {
+                    if (image != null) {
+                        image.close();
+                        image = null;
+                    }
                     failure = exception;
                 }
                 NativeImage completedImage = image;
@@ -197,6 +205,21 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 });
             });
         }, 0);
+    }
+
+    private static void copyReadbackToNativeImage(IntBuffer readbackPixels, NativeImage image, int width, int height) {
+        int[] rowPixels = new int[width];
+        IntBuffer imagePixels = MemoryUtil.memIntBuffer(image.imageId(), width * height);
+        for (int y = 0; y < height; y++) {
+            readbackPixels.position(y * width);
+            readbackPixels.get(rowPixels, 0, width);
+            for (int x = 0; x < width; x++) {
+                rowPixels[x] |= 0xFF000000;
+            }
+
+            imagePixels.position((height - y - 1) * width);
+            imagePixels.put(rowPixels, 0, width);
+        }
     }
 
     private static OtherClientPlayerEntity createRenderPlayerEntity(
@@ -396,7 +419,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static byte[] encodePngBytes(BufferedImage bufferedImage) throws IOException {
         int width = bufferedImage.getWidth();
         int height = bufferedImage.getHeight();
-        try (ByteArrayOutputStream output = new ByteArrayOutputStream(Math.max(1024, width * height / 2))) {
+        try (ByteArrayOutputStream output = new ByteArrayOutputStream(initialPngBufferSize(width, height))) {
             if (!ImageIO.write(bufferedImage, "png", output)) {
                 throw new IOException("No PNG image writer available.");
             }
@@ -404,12 +427,67 @@ public final class SpectatorCamClient implements ClientModInitializer {
         }
     }
 
+    private static int initialPngBufferSize(int width, int height) {
+        long estimate = Math.max(1024L, ((long)width * height) / 2L);
+        return (int)Math.min(estimate, PNG_INITIAL_BUFFER_LIMIT);
+    }
+
     private static BufferedImage toBufferedImage(NativeImage image) {
         int width = image.getWidth();
         int height = image.getHeight();
-        BufferedImage bufferedImage = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-        bufferedImage.setRGB(0, 0, width, height, image.copyPixelsArgb(), 0, width);
-        return bufferedImage;
+        return createArgbImage(width, height, image.copyPixelsArgb());
+    }
+
+    private static BufferedImage createArgbImage(int width, int height) {
+        return new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+    }
+
+    private static BufferedImage createArgbImage(int width, int height, int[] pixels) {
+        DataBufferInt buffer = new DataBufferInt(pixels, pixels.length);
+        WritableRaster raster = Raster.createPackedRaster(buffer, width, height, width, ARGB_BAND_MASKS, null);
+        return new BufferedImage(ARGB_COLOR_MODEL, raster, false, null);
+    }
+
+    private static int[] argbPixels(BufferedImage image) {
+        DataBuffer buffer = image.getRaster().getDataBuffer();
+        if (buffer instanceof DataBufferInt intBuffer && intBuffer.getNumBanks() == 1) {
+            return intBuffer.getData();
+        }
+
+        return image.getRGB(0, 0, image.getWidth(), image.getHeight(), null, 0, image.getWidth());
+    }
+
+    private static int[] mutableArgbPixels(BufferedImage image) {
+        DataBuffer buffer = image.getRaster().getDataBuffer();
+        if (buffer instanceof DataBufferInt intBuffer && intBuffer.getNumBanks() == 1) {
+            return intBuffer.getData();
+        }
+
+        throw new IllegalArgumentException("Expected a mutable integer ARGB image.");
+    }
+
+    private static void copyNativeImageToArgbImage(NativeImage source, BufferedImage target, int targetX, int targetY) {
+        int sourceWidth = source.getWidth();
+        int sourceHeight = source.getHeight();
+        int targetWidth = target.getWidth();
+        int[] targetPixels = mutableArgbPixels(target);
+        int[] rowPixels = new int[sourceWidth];
+        IntBuffer sourcePixels = MemoryUtil.memIntBuffer(source.imageId(), sourceWidth * sourceHeight);
+
+        for (int y = 0; y < sourceHeight; y++) {
+            sourcePixels.position(y * sourceWidth);
+            sourcePixels.get(rowPixels, 0, sourceWidth);
+            int targetOffset = (targetY + y) * targetWidth + targetX;
+            for (int x = 0; x < sourceWidth; x++) {
+                targetPixels[targetOffset + x] = abgrToArgb(rowPixels[x]);
+            }
+        }
+    }
+
+    private static int abgrToArgb(int abgr) {
+        return (abgr & 0xFF00FF00)
+            | ((abgr & 0x00FF0000) >>> 16)
+            | ((abgr & 0x000000FF) << 16);
     }
 
     private static int scaledDimension(int sourceDimension, double factor) {
@@ -440,7 +518,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
     }
 
     private static BufferedImage drawResizedImage(BufferedImage source, int targetWidth, int targetHeight, Object interpolationHint) {
-        BufferedImage output = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB);
+        BufferedImage output = createArgbImage(targetWidth, targetHeight);
         Graphics2D graphics = output.createGraphics();
         try {
             graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, interpolationHint);
@@ -489,7 +567,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         int sourceWidth = source.getWidth();
         int sourceHeight = source.getHeight();
-        int[] sourcePixels = source.getRGB(0, 0, sourceWidth, sourceHeight, null, 0, sourceWidth);
+        int[] sourcePixels = argbPixels(source);
         int[] outputPixels = new int[targetWidth * targetHeight];
 
         double scaleX = (double)sourceWidth / targetWidth;
@@ -566,9 +644,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             }
         }
 
-        BufferedImage output = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB);
-        output.setRGB(0, 0, targetWidth, targetHeight, outputPixels, 0, targetWidth);
-        return output;
+        return createArgbImage(targetWidth, targetHeight, outputPixels);
     }
 
     private static double pixelCoverage(int pixelIndex, double min, double max) {
@@ -980,7 +1056,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         LiteralArgumentBuilder<FabricClientCommandSource> singleFovCommand = literal("fov")
             .executes(context -> SINGLE_CONTROLLER.fovStatus(context.getSource().getClient()))
-            .then(withSuggestions(argument("degrees", DoubleArgumentType.doubleArg(1.0, 179.0)), FOV_SUGGESTIONS)
+            .then(withSuggestions(argument("degrees", DoubleArgumentType.doubleArg()), FOV_SUGGESTIONS)
                 .executes(context -> SINGLE_CONTROLLER.setFov(
                     context.getSource().getClient(),
                     DoubleArgumentType.getDouble(context, "degrees")
@@ -1902,53 +1978,83 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 stitchedFaceSize = scaledDimension(sourceFaceSize, factor);
             }
 
-            BufferedImage stitched = new BufferedImage(stitchedFaceSize * 3, stitchedFaceSize * 2, BufferedImage.TYPE_INT_ARGB);
+            BufferedImage stitched = createArgbImage(stitchedFaceSize * 3, stitchedFaceSize * 2);
+            try {
+                if (stitchedFaceSize == sourceFaceSize) {
+                    copyFacesIntoCubemap(faces, stitched, stitchedFaceSize);
+                } else {
+                    drawResizedFacesIntoCubemap(faces, stitched, stitchedFaceSize, interpolation);
+                }
+
+                BufferedImage output = stitched;
+                if (factor > MIN_DOWNSCALE_FACTOR && stage == DownscaleStage.CUBEMAP) {
+                    int targetWidth = scaledDimension(stitched.getWidth(), factor);
+                    int targetHeight = scaledDimension(stitched.getHeight(), factor);
+                    output = resizeBufferedImage(stitched, targetWidth, targetHeight, interpolation);
+                }
+
+                try {
+                    return encodePngBytes(output);
+                } finally {
+                    if (output != stitched) {
+                        output.flush();
+                    }
+                }
+            } finally {
+                stitched.flush();
+            }
+        }
+
+        private void copyFacesIntoCubemap(NativeImage[] faces, BufferedImage stitched, int faceSize) {
+            for (int row = 0; row < 2; row++) {
+                for (int col = 0; col < 3; col++) {
+                    int faceIndex = CUBEMAP_LAYOUT[row * 3 + col];
+                    try {
+                        copyNativeImageToArgbImage(faces[faceIndex], stitched, col * faceSize, row * faceSize);
+                    } finally {
+                        closeFace(faces, faceIndex);
+                    }
+                }
+            }
+        }
+
+        private void drawResizedFacesIntoCubemap(
+            NativeImage[] faces,
+            BufferedImage stitched,
+            int faceSize,
+            DownscaleInterpolation interpolation
+        ) {
             Graphics2D stitchedGraphics = stitched.createGraphics();
             try {
                 for (int row = 0; row < 2; row++) {
                     for (int col = 0; col < 3; col++) {
                         int faceIndex = CUBEMAP_LAYOUT[row * 3 + col];
-                        BufferedImage face = toBufferedImage(faces[faceIndex]);
                         try {
-                            BufferedImage sourceForDraw = face;
-                            if (stitchedFaceSize != sourceFaceSize) {
-                                sourceForDraw = resizeBufferedImage(face, stitchedFaceSize, stitchedFaceSize, interpolation);
-                            }
+                            BufferedImage face = toBufferedImage(faces[faceIndex]);
                             try {
-                                stitchedGraphics.drawImage(
-                                    sourceForDraw,
-                                    col * stitchedFaceSize,
-                                    row * stitchedFaceSize,
-                                    null
-                                );
-                            } finally {
-                                if (sourceForDraw != face) {
-                                    sourceForDraw.flush();
+                                BufferedImage sourceForDraw = resizeBufferedImage(face, faceSize, faceSize, interpolation);
+                                try {
+                                    stitchedGraphics.drawImage(
+                                        sourceForDraw,
+                                        col * faceSize,
+                                        row * faceSize,
+                                        null
+                                    );
+                                } finally {
+                                    if (sourceForDraw != face) {
+                                        sourceForDraw.flush();
+                                    }
                                 }
+                            } finally {
+                                face.flush();
                             }
                         } finally {
-                            face.flush();
+                            closeFace(faces, faceIndex);
                         }
                     }
                 }
             } finally {
                 stitchedGraphics.dispose();
-            }
-
-            BufferedImage output = stitched;
-            if (factor > MIN_DOWNSCALE_FACTOR && stage == DownscaleStage.CUBEMAP) {
-                int targetWidth = scaledDimension(stitched.getWidth(), factor);
-                int targetHeight = scaledDimension(stitched.getHeight(), factor);
-                output = resizeBufferedImage(stitched, targetWidth, targetHeight, interpolation);
-            }
-
-            try {
-                return encodePngBytes(output);
-            } finally {
-                if (output != stitched) {
-                    output.flush();
-                }
-                stitched.flush();
             }
         }
 
@@ -2130,10 +2236,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
         private void closeFaces(NativeImage[] faces) {
             for (int i = 0; i < faces.length; i++) {
-                if (faces[i] != null) {
-                    faces[i].close();
-                    faces[i] = null;
-                }
+                closeFace(faces, i);
+            }
+        }
+
+        private void closeFace(NativeImage[] faces, int index) {
+            if (faces[index] != null) {
+                faces[index].close();
+                faces[index] = null;
             }
         }
 
@@ -2162,8 +2272,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private static final int MIN_SINGLE_DIMENSION = 64;
         private static final int MAX_SINGLE_DIMENSION = 4096;
         private static final double DEFAULT_SINGLE_FOV = 90.0;
-        private static final double MIN_SINGLE_FOV = 1.0;
-        private static final double MAX_SINGLE_FOV = 179.0;
+        private static final int VANILLA_SINGLE_FOV_BASE = 90;
 
         private volatile boolean running;
         private long tickCounter;
@@ -2298,7 +2407,12 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private int importPerspectiveState(MinecraftClient client, PerspectiveReverserState state) {
             captureWidth = clampDimension(state.screenWidth());
             captureHeight = clampDimension(state.screenHeight());
-            captureFov = clampFov(state.cameraFov());
+            double importedFov = state.cameraFov();
+            if (!isRenderableFov(importedFov)) {
+                send(client, "PerspectiveReverser single FOV must be a finite positive number.");
+                return 0;
+            }
+            captureFov = importedFov;
             ReferenceTransform importedReferenceTransform = state.toReferenceTransform(captureWidth, captureHeight);
 
             int result = startAt(
@@ -2392,7 +2506,11 @@ public final class SpectatorCamClient implements ClientModInitializer {
         }
 
         private int setFov(MinecraftClient client, double fov) {
-            captureFov = clampFov(fov);
+            if (!isRenderableFov(fov)) {
+                send(client, "Single preview FOV must be a finite positive number.");
+                return 0;
+            }
+            captureFov = fov;
             send(client, String.format(Locale.ROOT, "Single preview FOV set to %s.", formatFov(captureFov)));
             return 1;
         }
@@ -2469,8 +2587,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             int width = captureWidth;
             int height = captureHeight;
             double targetFov = captureFov;
-            int targetBaseFov = clampFovInteger((int)Math.round(targetFov));
-            float targetFovScale = (float)(targetFov / (double)targetBaseFov);
+            float targetFovScale = fovScaleFor(targetFov);
             ensureFramebuffers(width, height);
 
             MinecraftClientAccessor clientAccessor = (MinecraftClientAccessor)client;
@@ -2502,7 +2619,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             client.setCameraEntity(singleEntity);
             client.options.setPerspective(Perspective.FIRST_PERSON);
-            client.options.getFov().setValue(targetBaseFov);
+            client.options.getFov().setValue(VANILLA_SINGLE_FOV_BASE);
             client.options.hudHidden = !renderPlayerEnabled;
             gameRendererAccessor.spectatorcam$setRenderBlockOutline(false);
             gameRendererAccessor.spectatorcam$setFovScale(targetFovScale);
@@ -2700,15 +2817,25 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return Math.max(MIN_SINGLE_DIMENSION, Math.min(MAX_SINGLE_DIMENSION, value));
         }
 
-        private double clampFov(double fov) {
-            return Math.max(MIN_SINGLE_FOV, Math.min(MAX_SINGLE_FOV, fov));
+        private boolean isRenderableFov(double fov) {
+            if (!Double.isFinite(fov) || fov <= 0.0) {
+                return false;
+            }
+
+            float scale = fovScaleFor(fov);
+            return Float.isFinite(scale) && scale > 0.0f;
         }
 
-        private int clampFovInteger(int fov) {
-            return Math.max((int)MIN_SINGLE_FOV, Math.min((int)MAX_SINGLE_FOV, fov));
+        private float fovScaleFor(double fov) {
+            return (float)(fov / (double)VANILLA_SINGLE_FOV_BASE);
         }
 
         private String formatFov(double fov) {
+            double absolute = Math.abs(fov);
+            if (absolute > 0.0 && (absolute < 0.00001 || absolute >= 100000.0)) {
+                return String.format(Locale.ROOT, "%.6g", fov);
+            }
+
             String text = String.format(Locale.ROOT, "%.5f", fov);
             int end = text.length();
             while (end > 0 && text.charAt(end - 1) == '0') {

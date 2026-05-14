@@ -251,6 +251,11 @@
     opacityValue.textContent = opacityInput.value + "%";
   }
 
+  function resetOpacityToFull() {
+    opacityInput.value = "100";
+    updateOpacityLabel();
+  }
+
   function updateReferenceEvLabel() {
     const amount = getReferenceEvAmount();
     referenceEvValue.textContent = amount > 0
@@ -600,6 +605,9 @@
     if (!autoFlipToggle.checked) {
       return;
     }
+
+    resetOpacityToFull();
+    requestRedraw();
 
     const intervalMs = Math.max(100, Math.round(Number(autoFlipIntervalInput.value) || 1000));
     autoFlipIntervalInput.value = intervalMs;
