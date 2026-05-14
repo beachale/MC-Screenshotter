@@ -11,6 +11,8 @@ Vibecoded, of course, but works fine. More features may come in the future.
 
 Usage
 
+/panshot clipboard (paste data from andrew's perspective reverser to automate setup)
+
 /panshot panorama every 5
 
 /panshot single every 5
