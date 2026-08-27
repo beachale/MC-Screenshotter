@@ -20,11 +20,11 @@ final class VideoCompressionFilter {
         return apply(image, amount, Profile.VIDEO);
     }
 
-    synchronized BufferedImage applyOldYoutube(BufferedImage image, int amount) {
-        return apply(image, amount, Profile.OLD_YOUTUBE);
+    synchronized BufferedImage applyOldYt(BufferedImage image, int amount) {
+        return apply(image, amount, Profile.OLD_YT);
     }
 
-    static int oldYoutubeJpegCompressionAmount(int amount) {
+    static int oldYtJpegCompressionAmount(int amount) {
         validateAmount(amount);
         return 10 + amount / 2;
     }
@@ -44,12 +44,12 @@ final class VideoCompressionFilter {
             profile = requestedProfile;
         }
 
-        if (requestedProfile == Profile.OLD_YOUTUBE && amount > 0) {
-            applyOldYoutubeScaling(image, amount);
+        if (requestedProfile == Profile.OLD_YT && amount > 0) {
+            applyOldYtScaling(image, amount);
         }
         int[] pixels = mutablePixels(image);
         if (amount > 0) {
-            applyArtifacts(pixels, amount, requestedProfile == Profile.OLD_YOUTUBE);
+            applyArtifacts(pixels, amount, requestedProfile == Profile.OLD_YT);
         }
         previousFrame = pixels;
         return image;
@@ -63,12 +63,12 @@ final class VideoCompressionFilter {
         profile = null;
     }
 
-    private void applyArtifacts(int[] pixels, int amount, boolean oldYoutube) {
-        int lumaStep = 1 + amount * amount / (oldYoutube ? 320 : 400);
-        int chromaStep = 1 + amount * amount / (oldYoutube ? 500 : 600);
+    private void applyArtifacts(int[] pixels, int amount, boolean oldYt) {
+        int lumaStep = 1 + amount * amount / (oldYt ? 320 : 400);
+        int chromaStep = 1 + amount * amount / (oldYt ? 500 : 600);
         int chromaBlockSize = amount < 20 ? 1 : amount < 60 ? 2 : amount < 90 ? 4 : 8;
-        int smoothing = Math.max(0, amount - (oldYoutube ? 20 : 35));
-        int maximumTemporalBlend = Math.max(0, amount - (oldYoutube ? 25 : 35)) / 2;
+        int smoothing = Math.max(0, amount - (oldYt ? 20 : 35));
+        int maximumTemporalBlend = Math.max(0, amount - (oldYt ? 25 : 35)) / 2;
         int temporalMotionRange = 16 + amount / 2;
 
         for (int blockY = 0; blockY < height; blockY += MACROBLOCK_SIZE) {
@@ -92,7 +92,7 @@ final class VideoCompressionFilter {
         }
     }
 
-    private static void applyOldYoutubeScaling(BufferedImage image, int amount) {
+    private static void applyOldYtScaling(BufferedImage image, int amount) {
         double scaleFactor = 1.0 + amount * 3.0 / 100.0;
         int reducedWidth = Math.max(1, (int)Math.round(image.getWidth() / scaleFactor));
         int reducedHeight = Math.max(1, (int)Math.round(image.getHeight() / scaleFactor));
@@ -228,6 +228,6 @@ final class VideoCompressionFilter {
 
     private enum Profile {
         VIDEO,
-        OLD_YOUTUBE
+        OLD_YT
     }
 }

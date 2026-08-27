@@ -49,7 +49,7 @@ PanShot commands are client-side commands. Common examples:
 /panshot single downscale 2 faces box
 /panshot single compression 25
 /panshot single compression video 70
-/panshot single compression youtube 70
+/panshot single compression yt 70
 /panshot panorama downscale 2.0 cubemap bicubic
 /panshot panorama resolution 2048
 /panshot panorama nudge 0.05
@@ -66,13 +66,13 @@ Compression amounts range from 0 to 100. Higher values produce stronger degradat
 | Off | `/panshot single compression off` | Lossless PNG output |
 | JPEG | `/panshot single compression jpeg <amount>` | Configurable JPEG quality; defaults to 25% compression |
 | Video | `/panshot single compression video <amount>` | Low-bitrate video-style macroblocking, chroma loss, quantization, and motion-aware temporal smearing; defaults to 70% |
-| YouTube | `/panshot single compression youtube <amount>` | Old 360p-era screen-video softness, blocking, banding, chroma bleed, and temporal smearing; defaults to 70% |
+| YT | `/panshot single compression yt <amount>` | Old 360p-era screen-video softness, blocking, banding, chroma bleed, and temporal smearing; defaults to 70% |
 
 `/panshot single compression <amount>` is a shortcut for JPEG mode. Running `/panshot single compression` enables JPEG using the current amount.
 
-Video and YouTube modes use a self-contained Java filter on the background encoding thread and do not require FFmpeg or another native dependency. Use `compression off` when exact lossless output is required.
+Video and YT modes use a self-contained Java filter on the background encoding thread and do not require FFmpeg or another native dependency. Use `compression off` when exact lossless output is required.
 
-The YouTube filter temporarily reduces detail internally and scales it back to the configured capture dimensions. It does not change the delivered image dimensions. Only the explicit `single downscale` command reduces them.
+The YT filter temporarily reduces detail internally and scales it back to the configured capture dimensions. It does not change the delivered image dimensions. Only the explicit `single downscale` command reduces them.
 
 ## Panorama recreation example
 

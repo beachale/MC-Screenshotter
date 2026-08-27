@@ -78,7 +78,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static final double DEFAULT_SINGLE_INTERVAL_SECONDS = 1.0;
     private static final int DEFAULT_JPEG_COMPRESSION_AMOUNT = 25;
     private static final int DEFAULT_VIDEO_COMPRESSION_AMOUNT = 70;
-    private static final int DEFAULT_OLD_YOUTUBE_COMPRESSION_AMOUNT = 70;
+    private static final int DEFAULT_OLD_YT_COMPRESSION_AMOUNT = 70;
     private static final int VIDEO_TRANSPORT_JPEG_COMPRESSION_AMOUNT = 10;
     private static final double MIN_DOWNSCALE_FACTOR = 1.0;
     private static final String[] INTERVAL_SUGGESTIONS = {"0.1", "0.5", "1", "2", "5", "10", "30", "60"};
@@ -421,7 +421,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         OFF,
         JPEG,
         VIDEO,
-        OLD_YOUTUBE
+        OLD_YT
     }
 
     private static byte[] encodePngBytes(NativeImage image) throws IOException {
@@ -1124,14 +1124,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 IntegerArgumentType.getInteger(context, "videoAmount")
             )));
 
-        LiteralArgumentBuilder<FabricClientCommandSource> oldYoutubeCompressionCommand = literal("youtube")
-            .executes(context -> SINGLE_CONTROLLER.enableOldYoutubeCompression(context.getSource().getClient()))
+        LiteralArgumentBuilder<FabricClientCommandSource> oldYtCompressionCommand = literal("yt")
+            .executes(context -> SINGLE_CONTROLLER.enableOldYtCompression(context.getSource().getClient()))
             .then(withSuggestions(
-                argument("youtubeAmount", IntegerArgumentType.integer(0, 100)),
+                argument("ytAmount", IntegerArgumentType.integer(0, 100)),
                 COMPRESSION_AMOUNT_SUGGESTIONS
-            ).executes(context -> SINGLE_CONTROLLER.setOldYoutubeCompression(
+            ).executes(context -> SINGLE_CONTROLLER.setOldYtCompression(
                 context.getSource().getClient(),
-                IntegerArgumentType.getInteger(context, "youtubeAmount")
+                IntegerArgumentType.getInteger(context, "ytAmount")
             )));
 
         LiteralArgumentBuilder<FabricClientCommandSource> singleCompressionCommand = literal("compression")
@@ -1139,7 +1139,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             .then(literal("off").executes(context -> SINGLE_CONTROLLER.disableCompression(context.getSource().getClient())))
             .then(jpegCompressionCommand)
             .then(videoCompressionCommand)
-            .then(oldYoutubeCompressionCommand)
+            .then(oldYtCompressionCommand)
             .then(withSuggestions(
                 argument("amount", IntegerArgumentType.integer(0, 100)),
                 COMPRESSION_AMOUNT_SUGGESTIONS
@@ -2355,7 +2355,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private volatile SingleCompressionMode compressionMode = SingleCompressionMode.OFF;
         private volatile int jpegCompressionAmount = DEFAULT_JPEG_COMPRESSION_AMOUNT;
         private volatile int videoCompressionAmount = DEFAULT_VIDEO_COMPRESSION_AMOUNT;
-        private volatile int oldYoutubeCompressionAmount = DEFAULT_OLD_YOUTUBE_COMPRESSION_AMOUNT;
+        private volatile int oldYtCompressionAmount = DEFAULT_OLD_YT_COMPRESSION_AMOUNT;
         private volatile boolean renderPlayerEnabled;
         private volatile byte[] latestImageBytes;
         private volatile long latestImageTimestamp;
@@ -2661,16 +2661,16 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return 1;
         }
 
-        private int enableOldYoutubeCompression(MinecraftClient client) {
-            compressionMode = SingleCompressionMode.OLD_YOUTUBE;
+        private int enableOldYtCompression(MinecraftClient client) {
+            compressionMode = SingleCompressionMode.OLD_YT;
             encodeExecutor.execute(videoCompressionFilter::reset);
             send(client, "Single compression enabled: " + describeCompression() + ". Applies to the next captured frame.");
             return 1;
         }
 
-        private int setOldYoutubeCompression(MinecraftClient client, int compressionAmount) {
-            oldYoutubeCompressionAmount = compressionAmount;
-            compressionMode = SingleCompressionMode.OLD_YOUTUBE;
+        private int setOldYtCompression(MinecraftClient client, int compressionAmount) {
+            oldYtCompressionAmount = compressionAmount;
+            compressionMode = SingleCompressionMode.OLD_YT;
             encodeExecutor.execute(videoCompressionFilter::reset);
             send(client, "Single compression set to " + describeCompression() + ". Applies to the next captured frame.");
             return 1;
@@ -2697,10 +2697,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     "video %d%% (stateful low-bitrate emulation)",
                     videoCompressionAmount
                 );
-                case OLD_YOUTUBE -> String.format(
+                case OLD_YT -> String.format(
                     Locale.ROOT,
-                    "YouTube %d%% (old 360p-style emulation)",
-                    oldYoutubeCompressionAmount
+                    "YT %d%% (old 360p-style emulation)",
+                    oldYtCompressionAmount
                 );
             };
         }
@@ -2920,7 +2920,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             SingleCompressionMode capturedCompressionMode = compressionMode;
             int capturedCompressionAmount = switch (capturedCompressionMode) {
                 case VIDEO -> videoCompressionAmount;
-                case OLD_YOUTUBE -> oldYoutubeCompressionAmount;
+                case OLD_YT -> oldYtCompressionAmount;
                 default -> jpegCompressionAmount;
             };
             encodeExecutor.execute(() -> {
@@ -2934,7 +2934,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 } catch (Exception exception) {
                     boolean statefulCompressionDisabled = (
                         capturedCompressionMode == SingleCompressionMode.VIDEO
-                            || capturedCompressionMode == SingleCompressionMode.OLD_YOUTUBE
+                            || capturedCompressionMode == SingleCompressionMode.OLD_YT
                     ) && compressionMode == capturedCompressionMode;
                     if (statefulCompressionDisabled) {
                         compressionMode = SingleCompressionMode.OFF;
@@ -2978,9 +2978,9 @@ public final class SpectatorCamClient implements ClientModInitializer {
                         videoCompressionFilter.apply(output, compressionAmount),
                         VIDEO_TRANSPORT_JPEG_COMPRESSION_AMOUNT
                     );
-                    case OLD_YOUTUBE -> ImageEncoder.encodeJpeg(
-                        videoCompressionFilter.applyOldYoutube(output, compressionAmount),
-                        VideoCompressionFilter.oldYoutubeJpegCompressionAmount(compressionAmount)
+                    case OLD_YT -> ImageEncoder.encodeJpeg(
+                        videoCompressionFilter.applyOldYt(output, compressionAmount),
+                        VideoCompressionFilter.oldYtJpegCompressionAmount(compressionAmount)
                     );
                 };
             } finally {

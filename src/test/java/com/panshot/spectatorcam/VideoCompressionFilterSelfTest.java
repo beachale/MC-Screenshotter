@@ -33,30 +33,30 @@ public final class VideoCompressionFilterSelfTest {
         requireColorPreserved(0xFF5A8C28, 70);
         requireColorPreserved(0xFF7DAAF5, 70);
 
-        BufferedImage youtubeSource = createTestImage(width, height, 0);
-        BufferedImage youtubeLightFrame = copy(youtubeSource);
-        BufferedImage youtubeHeavyFrame = copy(youtubeSource);
-        BufferedImage youtubeLosslessFrame = copy(youtubeSource);
-        new VideoCompressionFilter().applyOldYoutube(youtubeLightFrame, 10);
-        new VideoCompressionFilter().applyOldYoutube(youtubeHeavyFrame, 90);
-        new VideoCompressionFilter().applyOldYoutube(youtubeLosslessFrame, 0);
+        BufferedImage ytSource = createTestImage(width, height, 0);
+        BufferedImage ytLightFrame = copy(ytSource);
+        BufferedImage ytHeavyFrame = copy(ytSource);
+        BufferedImage ytLosslessFrame = copy(ytSource);
+        new VideoCompressionFilter().applyOldYt(ytLightFrame, 10);
+        new VideoCompressionFilter().applyOldYt(ytHeavyFrame, 90);
+        new VideoCompressionFilter().applyOldYt(ytLosslessFrame, 0);
         require(
-            meanSquaredError(youtubeSource, youtubeHeavyFrame) > meanSquaredError(youtubeSource, youtubeLightFrame),
-            "Increasing old YouTube compression did not increase image loss."
+            meanSquaredError(ytSource, ytHeavyFrame) > meanSquaredError(ytSource, ytLightFrame),
+            "Increasing old YT compression did not increase image loss."
         );
         require(
-            meanSquaredError(youtubeSource, youtubeLosslessFrame) == 0.0,
-            "Zero old YouTube compression must preserve the frame before transport encoding."
+            meanSquaredError(ytSource, ytLosslessFrame) == 0.0,
+            "Zero old YT compression must preserve the frame before transport encoding."
         );
-        byte[] youtubeTransport = ImageEncoder.encodeJpeg(
-            youtubeHeavyFrame,
-            VideoCompressionFilter.oldYoutubeJpegCompressionAmount(90)
+        byte[] ytTransport = ImageEncoder.encodeJpeg(
+            ytHeavyFrame,
+            VideoCompressionFilter.oldYtJpegCompressionAmount(90)
         );
-        BufferedImage decodedYoutubeFrame = ImageIO.read(new ByteArrayInputStream(youtubeTransport));
-        require(decodedYoutubeFrame != null, "Old YouTube compression produced an unreadable JPEG.");
+        BufferedImage decodedYtFrame = ImageIO.read(new ByteArrayInputStream(ytTransport));
+        require(decodedYtFrame != null, "Old YT compression produced an unreadable JPEG.");
         require(
-            decodedYoutubeFrame.getWidth() == width && decodedYoutubeFrame.getHeight() == height,
-            "Old YouTube emulation changed the served image dimensions."
+            decodedYtFrame.getWidth() == width && decodedYtFrame.getHeight() == height,
+            "Old YT emulation changed the served image dimensions."
         );
 
         VideoCompressionFilter temporalFilter = new VideoCompressionFilter();
@@ -106,11 +106,11 @@ public final class VideoCompressionFilterSelfTest {
         firstFrame.flush();
         temporalFrame.flush();
         independentFrame.flush();
-        youtubeSource.flush();
-        youtubeLightFrame.flush();
-        youtubeHeavyFrame.flush();
-        youtubeLosslessFrame.flush();
-        decodedYoutubeFrame.flush();
+        ytSource.flush();
+        ytLightFrame.flush();
+        ytHeavyFrame.flush();
+        ytLosslessFrame.flush();
+        decodedYtFrame.flush();
         previousSolidFrame.flush();
         currentSolidFrame.flush();
         defaultSizeFrame.flush();
