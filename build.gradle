@@ -65,9 +65,18 @@ tasks.register('videoCompressionTest', JavaExec) {
     mainClass.set('com.panshot.spectatorcam.VideoCompressionFilterSelfTest')
 }
 
+tasks.register('panoramaFollowTest', JavaExec) {
+    group = 'verification'
+    description = 'Verifies panorama player-follow yaw, pitch, wrapping, and JSON output.'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass.set('com.panshot.spectatorcam.PanoramaFollowTargetSelfTest')
+}
+
 tasks.named('check') {
     dependsOn imageCompressionTest
     dependsOn videoCompressionTest
+    dependsOn panoramaFollowTest
 }
 
 def githubRepository = System.getenv('GITHUB_REPOSITORY')

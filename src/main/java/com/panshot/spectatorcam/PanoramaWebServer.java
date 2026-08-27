@@ -68,8 +68,20 @@ public final class PanoramaWebServer {
         boolean available = cubemapBytes != null && cubemapBytes.length > 0;
         long lastModified = provider != null ? provider.getLatestCubemapTimestamp() : 0L;
         boolean running = provider != null && provider.isPanoramaRunning();
+        String followTarget = provider != null ? provider.getFollowTargetJson() : null;
+        if (followTarget == null || followTarget.isBlank()) {
+            followTarget = "null";
+        }
 
-        String response = "{\"running\":" + running + ",\"available\":" + available + ",\"lastModified\":" + lastModified + "}";
+        String response = "{\"running\":"
+            + running
+            + ",\"available\":"
+            + available
+            + ",\"lastModified\":"
+            + lastModified
+            + ",\"followTarget\":"
+            + followTarget
+            + "}";
         byte[] payload = response.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
@@ -122,5 +134,7 @@ public final class PanoramaWebServer {
         byte[] getLatestCubemapBytes();
 
         long getLatestCubemapTimestamp();
+
+        String getFollowTargetJson();
     }
 }

@@ -1398,6 +1398,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private final NativeImage[] capturedFaces = new NativeImage[6];
         private volatile byte[] latestCubemapBytes;
         private volatile long latestCubemapTimestamp;
+        private volatile PanoramaFollowTarget followTarget;
         private volatile boolean exportToDisk;
         private volatile boolean preciseCaptureMode;
         private volatile boolean renderPlayerEnabled;
@@ -1425,6 +1426,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 stopInternal(client, false, "Panorama capture stopped because no world is loaded.");
                 return;
             }
+            updateFollowTarget(client.player);
 
             if (panoramaEntity == null || panoramaWorld != client.world) {
                 ensurePanoramaEntity(client.world);
@@ -1479,6 +1481,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             origin = new Vec3d(x, y, z);
             baseYaw = yaw;
             basePitch = clampPitch(pitch);
+            updateFollowTarget(client.player);
             intervalTicks = Math.max(1L, Math.round(intervalSeconds * 20.0));
             captureSessionId++;
             running = true;
@@ -2227,6 +2230,15 @@ public final class SpectatorCamClient implements ClientModInitializer {
             return new Vec3d(x, y, z);
         }
 
+        private void updateFollowTarget(ClientPlayerEntity player) {
+            followTarget = PanoramaFollowTarget.from(
+                origin,
+                baseYaw,
+                basePitch,
+                new Vec3d(player.getX(), player.getEyeY(), player.getZ())
+            );
+        }
+
         private void stopInternal(MinecraftClient client, boolean notify, String reason) {
             captureSessionId++;
             running = false;
@@ -2238,6 +2250,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             facesScheduledInCycle = 0;
             pendingFaceCaptures = 0;
             activeFaceIndex = -1;
+            followTarget = null;
             clearCapturedFaces();
             panoramaEntity = null;
             panoramaWorld = null;
@@ -2317,6 +2330,12 @@ public final class SpectatorCamClient implements ClientModInitializer {
         @Override
         public long getLatestCubemapTimestamp() {
             return latestCubemapTimestamp;
+        }
+
+        @Override
+        public String getFollowTargetJson() {
+            PanoramaFollowTarget target = followTarget;
+            return target == null ? null : target.toJson();
         }
     }
 

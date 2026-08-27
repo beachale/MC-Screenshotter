@@ -9,6 +9,7 @@ Captured images are published to viewers on localhost. The viewers support optio
 - Automatic single-image and panorama capture at a configurable interval
 - Independent camera position, rotation, field of view, and resolution
 - Local single-image and 360-degree cubemap viewers
+- Optional browser-side player following that preserves the chosen zoom
 - Reference-image comparison and perspective import
 - Custom resource packs, render distance, entities, and optional player rendering
 - Configurable downscaling and image-compression emulation
@@ -56,6 +57,8 @@ PanShot commands are client-side commands. Common examples:
 ```
 
 `/panshot clipboard` imports compatible perspective data from the clipboard to automate camera setup.
+
+The panorama viewer's **Follow player** option rotates only the browser view toward the player's current position. It preserves the browser's chosen zoom and does not move, attach, or change the perspective of the in-game capture camera.
 
 ## Single-image compression
 

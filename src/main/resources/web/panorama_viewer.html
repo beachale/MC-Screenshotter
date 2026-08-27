@@ -189,6 +189,7 @@
   <div class="row">
     <label><input id="flipToggle" type="checkbox"> Flip A/B</label>
     <label><input id="autoFlipToggle" type="checkbox"> Auto flip</label>
+    <label><input id="followPlayerToggle" type="checkbox"> Follow player</label>
     <label>Ms</label>
     <input id="autoFlipInterval" type="number" min="100" step="50" value="1000">
     <span id="viewValue" class="hint">FOV: 90</span>
@@ -198,7 +199,7 @@
     <span class="hint">Exact stitched pixels, no 360 reprojection.</span>
   </div>
   <div id="status" class="status">Connecting to panorama stream...</div>
-  <div class="hint">360 mode: drag to pan, wheel to zoom. Raw mode: drag/zoom exact atlas.</div>
+  <div class="hint">360 mode: drag to pan, wheel to zoom. Follow player rotates only the browser view and preserves zoom.</div>
 </div>
 
 <script src="https://unpkg.com/@egjs/view360@3.6.4/dist/view360.pkgd.min.js"></script>
@@ -231,6 +232,7 @@
   const flipToggle = document.getElementById("flipToggle");
   const autoFlipToggle = document.getElementById("autoFlipToggle");
   const autoFlipIntervalInput = document.getElementById("autoFlipInterval");
+  const followPlayerToggle = document.getElementById("followPlayerToggle");
   const rawToggle = document.getElementById("rawToggle");
   const statusEl = document.getElementById("status");
   const viewValue = document.getElementById("viewValue");
@@ -263,6 +265,10 @@
   let liveRequestToken = 0;
   let liveViewerInitialized = false;
   let pollStateTimer = null;
+  let followTarget = null;
+
+  const FOLLOW_POLL_INTERVAL_MS = 100;
+  const FOLLOW_TRANSITION_MS = 120;
 
   let rawZoom = 1;
   let rawPanX = 0;
@@ -443,6 +449,26 @@
       pitch: liveViewer.getPitch(),
       fov: liveViewer.getFov()
     };
+  }
+
+  function wrapDegrees(value) {
+    return ((value + 180) % 360 + 360) % 360 - 180;
+  }
+
+  function applyFollowTarget() {
+    const liveViewer = getActiveLiveViewer();
+    if (!followPlayerToggle.checked || !followTarget || !liveViewer || rawToggle.checked || livePointerActive) {
+      return;
+    }
+
+    const view = getLiveView();
+    const yaw = view.yaw + wrapDegrees(followTarget.yaw - view.yaw);
+    const pitch = clamp(Number(followTarget.pitch), -90, 90);
+    if (Math.abs(yaw - view.yaw) < 0.01 && Math.abs(pitch - view.pitch) < 0.01) {
+      return;
+    }
+
+    liveViewer.lookAt({ yaw, pitch }, FOLLOW_TRANSITION_MS);
   }
 
   function updateViewLabel() {
@@ -900,15 +926,20 @@
         throw new Error("State request failed: " + response.status);
       }
       const state = await response.json();
-      statusEl.textContent = "Running: " + state.running + " | Cubemap available: " + state.available + " | Last update: " + state.lastModified;
+      followTarget = state.followTarget || null;
+      const followStatus = followPlayerToggle.checked
+        ? (followTarget ? " | Following player" : " | Follow target unavailable")
+        : "";
+      statusEl.textContent = "Running: " + state.running + " | Cubemap available: " + state.available + " | Last update: " + state.lastModified + followStatus;
       if (state.available && state.lastModified > 0 && state.lastModified !== lastLiveTimestamp) {
         lastLiveTimestamp = state.lastModified;
         await refreshLiveCubemap(lastLiveTimestamp);
       }
+      applyFollowTarget();
     } catch (error) {
       statusEl.textContent = "State error: " + error.message;
     }
-    schedulePollState(1000);
+    schedulePollState(followPlayerToggle.checked ? FOLLOW_POLL_INTERVAL_MS : 1000);
   }
 
   function schedulePollState(delayMs) {
@@ -999,12 +1030,17 @@
 
   autoFlipToggle.addEventListener("change", applyAutoFlip);
   autoFlipIntervalInput.addEventListener("change", applyAutoFlip);
+  followPlayerToggle.addEventListener("change", () => {
+    applyFollowTarget();
+    schedulePollState(0);
+  });
 
   rawToggle.addEventListener("change", () => {
     rawZoom = 1;
     rawPanX = 0;
     rawPanY = 0;
     applyModeVisibility();
+    applyFollowTarget();
   });
 
   resetViewButton.addEventListener("click", () => {
@@ -1103,6 +1139,7 @@
     dragSourceContainer = null;
     updateLiveLayerVisibility();
     applyPendingLiveSwap();
+    applyFollowTarget();
   }
 
   window.addEventListener("pointerup", onLivePointerEnd, true);
