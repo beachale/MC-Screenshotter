@@ -76,6 +76,10 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static final String MESSAGE_PREFIX = "[PanShot] ";
     private static final double DEFAULT_PANORAMA_INTERVAL_SECONDS = 10.0;
     private static final double DEFAULT_SINGLE_INTERVAL_SECONDS = 1.0;
+    private static final int DEFAULT_JPEG_COMPRESSION_AMOUNT = 25;
+    private static final int DEFAULT_VIDEO_COMPRESSION_AMOUNT = 70;
+    private static final int DEFAULT_OLD_YOUTUBE_COMPRESSION_AMOUNT = 70;
+    private static final int VIDEO_TRANSPORT_JPEG_COMPRESSION_AMOUNT = 10;
     private static final double MIN_DOWNSCALE_FACTOR = 1.0;
     private static final String[] INTERVAL_SUGGESTIONS = {"0.1", "0.5", "1", "2", "5", "10", "30", "60"};
     private static final String[] DOWNSCALE_FACTOR_SUGGESTIONS = {"1", "1.5", "2", "3", "4", "6", "8", "16"};
@@ -86,6 +90,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
     private static final String[] SINGLE_RESOLUTION_SUGGESTIONS = {"256", "512", "1024", "1920", "2048", "3840", "4096"};
     private static final String[] FOV_SUGGESTIONS = {"0.5", "1", "30", "45", "60", "70", "90", "110", "150", "220"};
     private static final String[] NUDGE_SUGGESTIONS = {"-0.1", "-0.05", "0.05", "0.1", "0.25", "0.5"};
+    private static final String[] COMPRESSION_AMOUNT_SUGGESTIONS = {"0", "10", "25", "40", "50", "65", "70", "80", "90", "100"};
     private static final UUID CAMERA_PROFILE_ID = UUID.fromString("f0d6643c-af19-4e1e-948d-a5d2d7e2f27b");
     private static final PanoramaWebServer PANORAMA_WEB_SERVER = new PanoramaWebServer();
     private static final SinglePreviewWebServer SINGLE_WEB_SERVER = new SinglePreviewWebServer();
@@ -410,6 +415,13 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 default -> null;
             };
         }
+    }
+
+    private enum SingleCompressionMode {
+        OFF,
+        JPEG,
+        VIDEO,
+        OLD_YOUTUBE
     }
 
     private static byte[] encodePngBytes(NativeImage image) throws IOException {
@@ -1092,6 +1104,50 @@ public final class SpectatorCamClient implements ClientModInitializer {
                             StringArgumentType.getString(context, "interpolation")
                         )))));
 
+        LiteralArgumentBuilder<FabricClientCommandSource> jpegCompressionCommand = literal("jpeg")
+            .executes(context -> SINGLE_CONTROLLER.enableJpegCompression(context.getSource().getClient()))
+            .then(withSuggestions(
+                argument("jpegAmount", IntegerArgumentType.integer(0, 100)),
+                COMPRESSION_AMOUNT_SUGGESTIONS
+            ).executes(context -> SINGLE_CONTROLLER.setJpegCompression(
+                context.getSource().getClient(),
+                IntegerArgumentType.getInteger(context, "jpegAmount")
+            )));
+
+        LiteralArgumentBuilder<FabricClientCommandSource> videoCompressionCommand = literal("video")
+            .executes(context -> SINGLE_CONTROLLER.enableVideoCompression(context.getSource().getClient()))
+            .then(withSuggestions(
+                argument("videoAmount", IntegerArgumentType.integer(0, 100)),
+                COMPRESSION_AMOUNT_SUGGESTIONS
+            ).executes(context -> SINGLE_CONTROLLER.setVideoCompression(
+                context.getSource().getClient(),
+                IntegerArgumentType.getInteger(context, "videoAmount")
+            )));
+
+        LiteralArgumentBuilder<FabricClientCommandSource> oldYoutubeCompressionCommand = literal("youtube")
+            .executes(context -> SINGLE_CONTROLLER.enableOldYoutubeCompression(context.getSource().getClient()))
+            .then(withSuggestions(
+                argument("youtubeAmount", IntegerArgumentType.integer(0, 100)),
+                COMPRESSION_AMOUNT_SUGGESTIONS
+            ).executes(context -> SINGLE_CONTROLLER.setOldYoutubeCompression(
+                context.getSource().getClient(),
+                IntegerArgumentType.getInteger(context, "youtubeAmount")
+            )));
+
+        LiteralArgumentBuilder<FabricClientCommandSource> singleCompressionCommand = literal("compression")
+            .executes(context -> SINGLE_CONTROLLER.enableJpegCompression(context.getSource().getClient()))
+            .then(literal("off").executes(context -> SINGLE_CONTROLLER.disableCompression(context.getSource().getClient())))
+            .then(jpegCompressionCommand)
+            .then(videoCompressionCommand)
+            .then(oldYoutubeCompressionCommand)
+            .then(withSuggestions(
+                argument("amount", IntegerArgumentType.integer(0, 100)),
+                COMPRESSION_AMOUNT_SUGGESTIONS
+            ).executes(context -> SINGLE_CONTROLLER.setJpegCompression(
+                context.getSource().getClient(),
+                IntegerArgumentType.getInteger(context, "amount")
+            )));
+
         LiteralArgumentBuilder<FabricClientCommandSource> singleCommand = literal("single")
             .executes(context -> SINGLE_CONTROLLER.startAtPlayer(
                 context.getSource().getClient(),
@@ -1103,6 +1159,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             .then(singleFovCommand)
             .then(singleRenderPlayerCommand)
             .then(singleDownscaleCommand)
+            .then(singleCompressionCommand)
             .then(literal("clipboard").executes(context -> importPerspectiveClipboard(
                 context.getSource().getClient(),
                 PerspectiveImportMode.SINGLE
@@ -2295,9 +2352,14 @@ public final class SpectatorCamClient implements ClientModInitializer {
         private volatile ReferenceTransform referenceTransform;
         private volatile double downscaleFactor = MIN_DOWNSCALE_FACTOR;
         private volatile DownscaleInterpolation downscaleInterpolation = DownscaleInterpolation.BICUBIC;
+        private volatile SingleCompressionMode compressionMode = SingleCompressionMode.OFF;
+        private volatile int jpegCompressionAmount = DEFAULT_JPEG_COMPRESSION_AMOUNT;
+        private volatile int videoCompressionAmount = DEFAULT_VIDEO_COMPRESSION_AMOUNT;
+        private volatile int oldYoutubeCompressionAmount = DEFAULT_OLD_YOUTUBE_COMPRESSION_AMOUNT;
         private volatile boolean renderPlayerEnabled;
         private volatile byte[] latestImageBytes;
         private volatile long latestImageTimestamp;
+        private final VideoCompressionFilter videoCompressionFilter = new VideoCompressionFilter();
         private final ExecutorService encodeExecutor = Executors.newSingleThreadExecutor(runnable -> {
             Thread thread = new Thread(runnable, "panshot-single-encode");
             thread.setDaemon(true);
@@ -2372,6 +2434,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             referenceTransform = importedReferenceTransform;
             intervalTicks = Math.max(1L, Math.round(intervalSeconds * 20.0));
             captureSessionId++;
+            encodeExecutor.execute(videoCompressionFilter::reset);
             running = true;
             completedCaptures = 0;
             capturePending = false;
@@ -2388,7 +2451,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
 
             send(client, String.format(
                 Locale.ROOT,
-                "Single preview started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, %dx%d, fov %s, downscale %s, renderplayer %s).",
+                "Single preview started at %.3f %.3f %.3f every %.2f seconds (yaw %.1f, pitch %.1f, %dx%d, fov %s, downscale %s, compression %s, renderplayer %s).",
                 x,
                 y,
                 z,
@@ -2399,6 +2462,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 captureHeight,
                 formatFov(captureFov),
                 describeDownscale(),
+                describeCompression(),
                 renderPlayerEnabled ? "on" : "off"
             ));
             return 1;
@@ -2460,7 +2524,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
             double seconds = Math.max(0.0, (nextCaptureTick - tickCounter) / 20.0);
             send(client, String.format(
                 Locale.ROOT,
-                "Running: next frame in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, frames %d, %dx%d, fov %s, downscale %s, renderplayer %s).",
+                "Running: next frame in %.2f seconds from %.3f %.3f %.3f (yaw %.1f, pitch %.1f, frames %d, %dx%d, fov %s, downscale %s, compression %s, renderplayer %s).",
                 seconds,
                 origin.x,
                 origin.y,
@@ -2472,6 +2536,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 captureHeight,
                 formatFov(captureFov),
                 describeDownscale(),
+                describeCompression(),
                 renderPlayerEnabled ? "on" : "off"
             ));
             return 1;
@@ -2564,6 +2629,80 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 factor,
                 downscaleInterpolation.label
             );
+        }
+
+        private int enableJpegCompression(MinecraftClient client) {
+            compressionMode = SingleCompressionMode.JPEG;
+            encodeExecutor.execute(videoCompressionFilter::reset);
+            send(client, "Single compression enabled: " + describeCompression() + ". Applies to the next captured frame.");
+            return 1;
+        }
+
+        private int setJpegCompression(MinecraftClient client, int compressionAmount) {
+            jpegCompressionAmount = compressionAmount;
+            compressionMode = SingleCompressionMode.JPEG;
+            encodeExecutor.execute(videoCompressionFilter::reset);
+            send(client, "Single compression set to " + describeCompression() + ". Applies to the next captured frame.");
+            return 1;
+        }
+
+        private int enableVideoCompression(MinecraftClient client) {
+            compressionMode = SingleCompressionMode.VIDEO;
+            encodeExecutor.execute(videoCompressionFilter::reset);
+            send(client, "Single compression enabled: " + describeCompression() + ". Applies to the next captured frame.");
+            return 1;
+        }
+
+        private int setVideoCompression(MinecraftClient client, int compressionAmount) {
+            videoCompressionAmount = compressionAmount;
+            compressionMode = SingleCompressionMode.VIDEO;
+            encodeExecutor.execute(videoCompressionFilter::reset);
+            send(client, "Single compression set to " + describeCompression() + ". Applies to the next captured frame.");
+            return 1;
+        }
+
+        private int enableOldYoutubeCompression(MinecraftClient client) {
+            compressionMode = SingleCompressionMode.OLD_YOUTUBE;
+            encodeExecutor.execute(videoCompressionFilter::reset);
+            send(client, "Single compression enabled: " + describeCompression() + ". Applies to the next captured frame.");
+            return 1;
+        }
+
+        private int setOldYoutubeCompression(MinecraftClient client, int compressionAmount) {
+            oldYoutubeCompressionAmount = compressionAmount;
+            compressionMode = SingleCompressionMode.OLD_YOUTUBE;
+            encodeExecutor.execute(videoCompressionFilter::reset);
+            send(client, "Single compression set to " + describeCompression() + ". Applies to the next captured frame.");
+            return 1;
+        }
+
+        private int disableCompression(MinecraftClient client) {
+            compressionMode = SingleCompressionMode.OFF;
+            encodeExecutor.execute(videoCompressionFilter::reset);
+            send(client, "Single compression disabled; using lossless PNG. Applies to the next captured frame.");
+            return 1;
+        }
+
+        private String describeCompression() {
+            return switch (compressionMode) {
+                case OFF -> "off (lossless PNG)";
+                case JPEG -> String.format(
+                    Locale.ROOT,
+                    "JPEG %d%% (quality %d%%)",
+                    jpegCompressionAmount,
+                    100 - jpegCompressionAmount
+                );
+                case VIDEO -> String.format(
+                    Locale.ROOT,
+                    "video %d%% (stateful low-bitrate emulation)",
+                    videoCompressionAmount
+                );
+                case OLD_YOUTUBE -> String.format(
+                    Locale.ROOT,
+                    "YouTube %d%% (old 360p-style emulation)",
+                    oldYoutubeCompressionAmount
+                );
+            };
         }
 
         private int renderPlayerStatus(MinecraftClient client) {
@@ -2778,19 +2917,45 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 return;
             }
 
+            SingleCompressionMode capturedCompressionMode = compressionMode;
+            int capturedCompressionAmount = switch (capturedCompressionMode) {
+                case VIDEO -> videoCompressionAmount;
+                case OLD_YOUTUBE -> oldYoutubeCompressionAmount;
+                default -> jpegCompressionAmount;
+            };
             encodeExecutor.execute(() -> {
                 try (NativeImage capturedImage = image) {
-                    latestImageBytes = encodeSingleFrameBytes(capturedImage);
+                    latestImageBytes = encodeSingleFrameBytes(
+                        capturedImage,
+                        capturedCompressionMode,
+                        capturedCompressionAmount
+                    );
                     latestImageTimestamp = System.currentTimeMillis();
                 } catch (Exception exception) {
-                    client.execute(() -> send(client, "Single preview encode failed: " + exception.getMessage()));
+                    boolean statefulCompressionDisabled = (
+                        capturedCompressionMode == SingleCompressionMode.VIDEO
+                            || capturedCompressionMode == SingleCompressionMode.OLD_YOUTUBE
+                    ) && compressionMode == capturedCompressionMode;
+                    if (statefulCompressionDisabled) {
+                        compressionMode = SingleCompressionMode.OFF;
+                    }
+                    client.execute(() -> send(
+                        client,
+                        "Single preview encode failed: "
+                            + exception.getMessage()
+                            + (statefulCompressionDisabled ? " Stateful compression was disabled." : "")
+                    ));
                 } finally {
                     encodeInFlight.set(false);
                 }
             });
         }
 
-        private byte[] encodeSingleFrameBytes(NativeImage image) throws IOException {
+        private byte[] encodeSingleFrameBytes(
+            NativeImage image,
+            SingleCompressionMode capturedCompressionMode,
+            int compressionAmount
+        ) throws IOException {
             BufferedImage source = toBufferedImage(image);
             BufferedImage output = source;
             try {
@@ -2800,7 +2965,24 @@ public final class SpectatorCamClient implements ClientModInitializer {
                     int targetHeight = scaledDimension(source.getHeight(), factor);
                     output = resizeBufferedImage(source, targetWidth, targetHeight, downscaleInterpolation);
                 }
-                return encodePngBytes(output);
+                return switch (capturedCompressionMode) {
+                    case OFF -> {
+                        videoCompressionFilter.reset();
+                        yield encodePngBytes(output);
+                    }
+                    case JPEG -> {
+                        videoCompressionFilter.reset();
+                        yield ImageEncoder.encodeJpeg(output, compressionAmount);
+                    }
+                    case VIDEO -> ImageEncoder.encodeJpeg(
+                        videoCompressionFilter.apply(output, compressionAmount),
+                        VIDEO_TRANSPORT_JPEG_COMPRESSION_AMOUNT
+                    );
+                    case OLD_YOUTUBE -> ImageEncoder.encodeJpeg(
+                        videoCompressionFilter.applyOldYoutube(output, compressionAmount),
+                        VideoCompressionFilter.oldYoutubeJpegCompressionAmount(compressionAmount)
+                    );
+                };
             } finally {
                 if (output != source) {
                     output.flush();
@@ -2917,6 +3099,7 @@ public final class SpectatorCamClient implements ClientModInitializer {
                 singleRenderFramebuffer.delete();
                 singleRenderFramebuffer = null;
             }
+            encodeExecutor.execute(videoCompressionFilter::reset);
 
             if (reason != null) {
                 send(client, reason);

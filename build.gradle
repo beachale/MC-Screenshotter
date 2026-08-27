@@ -1,5 +1,5 @@
 plugins {
-    id 'fabric-loom' version '1.11-SNAPSHOT'
+    id 'fabric-loom' version '1.11.8'
     id 'maven-publish'
 }
 
@@ -43,13 +43,64 @@ java {
     targetCompatibility = JavaVersion.VERSION_21
 }
 
+tasks.withType(Jar).configureEach {
+    from(rootProject.file('LICENSE')) {
+        into 'META-INF'
+    }
+}
+
+tasks.register('imageCompressionTest', JavaExec) {
+    group = 'verification'
+    description = 'Verifies JPEG compression output, amount behavior, decoding, and MIME detection.'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass.set('com.panshot.spectatorcam.ImageEncoderSelfTest')
+}
+
+tasks.register('videoCompressionTest', JavaExec) {
+    group = 'verification'
+    description = 'Verifies video-style compression strength, temporal state, and frame output.'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass.set('com.panshot.spectatorcam.VideoCompressionFilterSelfTest')
+}
+
+tasks.named('check') {
+    dependsOn imageCompressionTest
+    dependsOn videoCompressionTest
+}
+
+def githubRepository = System.getenv('GITHUB_REPOSITORY')
+
 publishing {
     publications {
         mavenJava(MavenPublication) {
             from components.java
+
+            pom {
+                name = 'PanShot'
+                description = 'A client-side Fabric camera and screenshot recreation mod.'
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://opensource.org/license/mit/'
+                        distribution = 'repo'
+                    }
+                }
+            }
         }
     }
 
     repositories {
+        if (githubRepository) {
+            maven {
+                name = 'GitHubPackages'
+                url = uri("https://maven.pkg.github.com/${githubRepository}")
+                credentials {
+                    username = System.getenv('USERNAME')
+                    password = System.getenv('TOKEN')
+                }
+            }
+        }
     }
 }

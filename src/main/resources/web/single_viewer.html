@@ -538,7 +538,7 @@
 
   async function loadLiveImage(timestamp) {
     const token = ++liveRequestToken;
-    const response = await fetch("/live-single.png?ts=" + timestamp, { cache: "no-store" });
+    const response = await fetch("/live-single?ts=" + timestamp, { cache: "no-store" });
     if (!response.ok) {
       throw new Error("Live image request failed: " + response.status);
     }

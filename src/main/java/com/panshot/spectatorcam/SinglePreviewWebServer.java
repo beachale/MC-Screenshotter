@@ -29,6 +29,7 @@ public final class SinglePreviewWebServer {
         server = HttpServer.create(new InetSocketAddress(HOST, 0), 0);
         server.createContext("/", this::handleIndex);
         server.createContext("/api/state", this::handleState);
+        server.createContext("/live-single", this::handleLiveImage);
         server.createContext("/live-single.png", this::handleLiveImage);
         executor = Executors.newFixedThreadPool(2, runnable -> {
             Thread thread = new Thread(runnable, "panshot-single-web");
@@ -105,8 +106,9 @@ public final class SinglePreviewWebServer {
             return;
         }
 
-        exchange.getResponseHeaders().set("Content-Type", "image/png");
+        exchange.getResponseHeaders().set("Content-Type", detectImageContentType(payload));
         exchange.getResponseHeaders().set("Cache-Control", "no-store");
+        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
         exchange.sendResponseHeaders(200, payload.length);
         exchange.getResponseBody().write(payload);
         exchange.close();
@@ -126,6 +128,29 @@ public final class SinglePreviewWebServer {
         } catch (IOException exception) {
             throw new IllegalStateException("Failed to read resource: " + resourcePath, exception);
         }
+    }
+
+    static String detectImageContentType(byte[] payload) {
+        if (payload != null
+            && payload.length >= 3
+            && (payload[0] & 0xFF) == 0xFF
+            && (payload[1] & 0xFF) == 0xD8
+            && (payload[2] & 0xFF) == 0xFF) {
+            return "image/jpeg";
+        }
+        if (payload != null
+            && payload.length >= 8
+            && (payload[0] & 0xFF) == 0x89
+            && payload[1] == 'P'
+            && payload[2] == 'N'
+            && payload[3] == 'G'
+            && (payload[4] & 0xFF) == 0x0D
+            && (payload[5] & 0xFF) == 0x0A
+            && (payload[6] & 0xFF) == 0x1A
+            && (payload[7] & 0xFF) == 0x0A) {
+            return "image/png";
+        }
+        return "application/octet-stream";
     }
 
     public interface StateProvider {

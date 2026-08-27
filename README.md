@@ -1,41 +1,115 @@
-PanShot (Fabric)
-This mod detaches rendering from the local player by swapping MinecraftClient camera entity to a client-side spectator camera.
+# PanShot
 
-It's a mod which auto-captures single screenshot or panorama cubemap separate from the player's pov, so you can keep playing and the screenshots will be taken in a static position at whatever interval you choose.
+PanShot is a client-side Fabric mod that captures single images and panorama cubemaps from a camera detached from the local player. The camera remains at a fixed position while you continue playing.
 
-Generates a local 360 cubemap viewer or single image viewer with optional reference image/cubemap comparison for easy recreation. Essentially works like n00bbot + cubemap viewer, except it works entirely on the client side.
+Captured images are published to viewers on localhost. The viewers support optional reference-image and reference-cubemap comparison for screenshot recreation.
 
-Supports custom resource packs, render distance, entities, player rendering and cubemap export.
+## Features
 
-Vibecoded, of course, but works fine. More features may come in the future.
+- Automatic single-image and panorama capture at a configurable interval
+- Independent camera position, rotation, field of view, and resolution
+- Local single-image and 360-degree cubemap viewers
+- Reference-image comparison and perspective import
+- Custom resource packs, render distance, entities, and optional player rendering
+- Configurable downscaling and image-compression emulation
+- Panorama cubemap export
 
-Usage
+## Requirements
 
-/panshot clipboard (paste data from andrew's perspective reverser to automate setup)
+- Minecraft Java Edition 1.21.10
+- Java 21
+- Gradle 8.14.3 when building from source
+- Fabric Loader 0.17.3 or newer
+- Fabric API for Minecraft 1.21.10
 
+## Installation
+
+1. Install Fabric Loader and Fabric API for Minecraft 1.21.10.
+2. Place `panshot-1.0.0.jar` in the Minecraft `mods` directory.
+3. Start Minecraft using the Fabric profile.
+
+## Building
+
+With Gradle 8.14.3 installed, run from the project directory:
+
+```sh
+gradle build
+```
+
+The built mod and sources JARs are written to `build/libs`.
+
+## Usage
+
+PanShot commands are client-side commands. Common examples:
+
+```text
+/panshot clipboard
 /panshot panorama every 5
-
 /panshot single every 5
-
 /panshot single downscale 2 faces box
-
+/panshot single compression 25
+/panshot single compression video 70
+/panshot single compression youtube 70
 /panshot panorama downscale 2.0 cubemap bicubic
-
 /panshot panorama resolution 2048
-
 /panshot panorama nudge 0.05
+```
 
-Panorama resolution syntax:
+`/panshot clipboard` imports compatible perspective data from the clipboard to automate camera setup.
 
---------------------------------------------------------------
+## Single-image compression
 
-For a panorama recreation setup for e.g. 26.1, use this setup:
-Make sure to let go of mouse to prevent misaligning the camera
+Compression amounts range from 0 to 100. Higher values produce stronger degradation.
 
-`/tp @s -255.5281246385249 126 -2006.420387290336 -271.80280706639144 0`
+| Mode | Command | Behavior |
+| --- | --- | --- |
+| Off | `/panshot single compression off` | Lossless PNG output |
+| JPEG | `/panshot single compression jpeg <amount>` | Configurable JPEG quality; defaults to 25% compression |
+| Video | `/panshot single compression video <amount>` | Low-bitrate video-style macroblocking, chroma loss, quantization, and motion-aware temporal smearing; defaults to 70% |
+| YouTube | `/panshot single compression youtube <amount>` | Old 360p-era screen-video softness, blocking, banding, chroma bleed, and temporal smearing; defaults to 70% |
 
-`/panshot panorama resolution 4096`
+`/panshot single compression <amount>` is a shortcut for JPEG mode. Running `/panshot single compression` enables JPEG using the current amount.
 
-`/panshot panorama downscale 4 faces box`
+Video and YouTube modes use a self-contained Java filter on the background encoding thread and do not require FFmpeg or another native dependency. Use `compression off` when exact lossless output is required.
 
-`/panshot panorama every 1`
+The YouTube filter temporarily reduces detail internally and scales it back to the configured capture dimensions. It does not change the delivered image dimensions. Only the explicit `single downscale` command reduces them.
+
+## Panorama recreation example
+
+Release the mouse before starting capture to avoid moving the camera after alignment.
+
+```text
+/tp @s -255.5281246385249 126 -2006.420387290336 -271.80280706639144 0
+/panshot panorama resolution 4096
+/panshot panorama downscale 4 faces box
+/panshot panorama every 1
+```
+
+## License
+
+PanShot is available under the [MIT License](LICENSE).
+
+## Optional local Gradle wrapper
+
+The Gradle wrapper files are intentionally excluded from this repository. To create a local wrapper, install Gradle 8.14.3 and run this command from the project directory:
+
+```sh
+gradle :wrapper --gradle-version 8.14.3 --distribution-type bin
+```
+
+After generation, run Gradle through the wrapper on Windows:
+
+```powershell
+.\gradlew.bat build
+```
+
+Or on Linux and macOS:
+
+```sh
+chmod +x gradlew
+./gradlew build
+```
+
+To launch the mod in a development client, run `.\gradlew.bat runClient` on Windows or `./gradlew runClient` on Linux and macOS.
+
+The generated wrapper files remain ignored by Git and are only used locally.
